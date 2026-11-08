@@ -26,6 +26,7 @@ from monitor_maid.context import (
     conclusion_messages,
     normalise_summary,
     parse_conclusion_list,
+    seed_records,
     shutdown_plan,
     summary_messages,
     verification_prompt,
@@ -269,15 +270,82 @@ class Orchestrator(QObject):
         self._enqueue(Job(kind=f"{kind}_retry", session_id=self._retry_session))
         return True
 
-    def request_end(self, on_done: Callable[[], None], session_id: str | None = None) -> None:
+    def request_summary(self) -> bool:
+        """Ask the local model for a summary and store it. The session stays open."""
+        return self._request_note("summary")
+
+    def request_conclusions(self) -> bool:
+        """Ask the local model for conclusions and store them. The session stays open."""
+        return self._request_note("conclusion")
+
+    def plant_seed(self, items: list[HistoryItem]) -> bool:
+        """Copy the chosen rows from the database into the open session.
+
+        The new turns are ordinary messages, so the next local call sees them
+        and does not see the rest of the session they came from.
+        """
+        session = self.current()
+        if session is None or session.status != "open":
+            self.status_message.emit("There is no open session to continue.")
+            return False
+        records = seed_records(self._reload_items(items))
+        if not records:
+            self.status_message.emit("Nothing from that selection is still stored.")
+            return False
+        for actor, content, metadata in records:
+            self.db.add_turn(
+                session.id,
+                actor=actor,
+                kind="message",
+                content=content,
+                visible_to_local=True,
+                metadata=metadata,
+            )
+        updated = self.db.get_session(session.id)
+        if updated is not None and updated.title == "New session":
+            self.db.update_session(session.id, title="Continued session")
+        self._emit_session()
+        self.status_message.emit("Started a new session from the selected record.")
+        return True
+
+    def rename_session(self, title: str) -> bool:
+        """Keep a name the user chose. Later messages do not replace it."""
+        session = self.current()
+        if session is None:
+            self.status_message.emit("Open a session first.")
+            return False
+        cleaned = " ".join(title.split())
+        if not cleaned:
+            self.status_message.emit("Type a name for the session.")
+            return False
+        if len(cleaned) > 120:
+            cleaned = cleaned[:117] + "..."
+        if cleaned != session.title:
+            self.db.update_session(session.id, title=cleaned)
+            self._emit_session()
+        self.status_message.emit("Session renamed.")
+        return True
+
+    def request_end(
+        self,
+        on_done: Callable[[], None],
+        session_id: str | None = None,
+        *,
+        store_notes: bool = True,
+    ) -> None:
         self.accepting = False
         self.accepting_changed.emit(False)
         sid = session_id or self.session_id
         if sid is None:
             QTimer.singleShot(0, on_done)
             return
-        self.status_message.emit("Ending the session after queued messages finish.")
-        self._enqueue(Job(kind="end", session_id=sid, on_done=on_done))
+        if store_notes:
+            self.status_message.emit("Ending the session after queued messages finish.")
+        else:
+            self.status_message.emit("Closing the session without a summary.")
+        self._enqueue(
+            Job(kind="end", session_id=sid, on_done=on_done, store_notes=store_notes)
+        )
 
     def cancel_shutdown(self) -> None:
         job = self._job
@@ -404,6 +472,10 @@ class Orchestrator(QObject):
             elif job.kind == "both":
                 self._prepare_turns(job)
                 self._start_local(job.session_id or "", self._then_grok)
+            elif job.kind == "make_summary":
+                self._start_manual_summary(job.session_id or "")
+            elif job.kind == "make_conclusion":
+                self._start_manual_conclusions(job.session_id or "")
             else:
                 log.error("unknown job kind %s", job.kind)
                 self._finish_job()
@@ -965,18 +1037,204 @@ class Orchestrator(QObject):
         self.transcript_changed.emit()
         self._start_local(sid, self._next_relay)
 
+    def _request_note(self, kind: str) -> bool:
+        if not self.accepting:
+            self.status_message.emit("The session is ending. Nothing was stored.")
+            return False
+        session = self.current()
+        if session is None:
+            self.status_message.emit("Open a session first.")
+            return False
+        if session.status == "closing":
+            self.status_message.emit("This session is already closing.")
+            return False
+        plan = shutdown_plan(self.db.list_turns(session.id))
+        if kind == "summary":
+            empty = "There is nothing in this session to summarise yet."
+            job_kind = "make_summary"
+            preview = "Create summary"
+        else:
+            empty = "There is nothing in this session to draw conclusions from yet."
+            job_kind = "make_conclusion"
+            preview = "Create conclusions"
+        if plan == "skip":
+            self.status_message.emit(empty)
+            return False
+        if plan == "note":
+            if kind == "summary":
+                self._store_manual_summary(session.id, NO_SUBSTANTIAL)
+            else:
+                self._store_manual_conclusions(session.id, [NO_SUBSTANTIAL])
+            return True
+        job = Job(kind=job_kind, session_id=session.id, local_text=preview)
+        self._enqueue(job)
+        if self._job is not job:
+            label = "Summary" if kind == "summary" else "Conclusions"
+            self.status_message.emit(f"{label} queued. This session stays open.")
+        return True
+
+    def _reload_items(self, items: list[HistoryItem]) -> list[HistoryItem]:
+        loaded: list[HistoryItem] = []
+        for item in items:
+            fresh = self._reload_item(item)
+            if fresh is not None and fresh.content.strip():
+                loaded.append(fresh)
+        return loaded
+
+    def _reload_item(self, item: HistoryItem) -> HistoryItem | None:
+        if item.kind in {"question", "answer", "grok"}:
+            turn = self.db.get_turn(item.source_id)
+            if turn is None:
+                return None
+            return HistoryItem(
+                key=item.key or f"turn:{turn.id}",
+                kind=item.kind,
+                actor=turn.actor,
+                created_at=turn.created_at,
+                content=turn.content,
+                source_id=turn.id,
+            )
+        if item.kind == "summary":
+            summary = self.db.get_summary(item.source_id)
+            if summary is None:
+                return None
+            return HistoryItem(
+                key=item.key or f"summary:{summary.id}",
+                kind="summary",
+                actor="local_llm",
+                created_at=summary.created_at,
+                content=summary.content,
+                source_id=summary.id,
+            )
+        if item.kind == "conclusion":
+            conclusion = self.db.get_conclusion(item.source_id)
+            if conclusion is None:
+                return None
+            return HistoryItem(
+                key=item.key or f"conclusion:{conclusion.id}",
+                kind="conclusion",
+                actor="local_llm",
+                created_at=conclusion.created_at,
+                content=conclusion.content,
+                source_id=conclusion.id,
+            )
+        return None
+
+    def _store_manual_summary(self, sid: str, summary: str) -> None:
+        summary_text = normalise_summary(summary)
+        self.db.add_summary(sid, summary_text)
+        self.db.add_turn(
+            sid,
+            actor="local_llm",
+            kind="summary",
+            content=summary_text,
+            visible_to_local=True,
+        )
+        self._emit_session()
+        session = self.db.get_session(sid)
+        if session is not None and session.status == "open":
+            self.status_message.emit("Summary stored. This session stays open.")
+        else:
+            self.status_message.emit("Summary stored.")
+        log.info("stored manual summary for %s", sid)
+
+    def _store_manual_conclusions(self, sid: str, conclusions: list[str]) -> None:
+        items = [item.strip() for item in conclusions if item and item.strip()] or [NO_SUBSTANTIAL]
+        for item in items:
+            self.db.add_conclusion(sid, item)
+        body = "\n".join(f"- {item}" for item in items)
+        self.db.add_turn(
+            sid,
+            actor="local_llm",
+            kind="conclusion",
+            content=body,
+            visible_to_local=True,
+        )
+        self._emit_session()
+        session = self.db.get_session(sid)
+        count = len(items)
+        if session is not None and session.status == "open":
+            self.status_message.emit(
+                f"{count} conclusion{'s' if count != 1 else ''} stored. This session stays open."
+            )
+        else:
+            self.status_message.emit(f"{count} conclusion{'s' if count != 1 else ''} stored.")
+        log.info("stored %s manual conclusions for %s", count, sid)
+
+    def _start_manual_summary(self, sid: str) -> None:
+        self.status_message.emit("Asking the local model for a summary…")
+        session = self.db.get_session(sid)
+        if session is None:
+            self._finish_job()
+            return
+        settings = Settings.load(self.db)
+        model = session.ollama_model if session.ollama_model else settings.ollama_model
+        messages = summary_messages(self.db.list_turns(sid), cwd=self.cwd)
+        client = OllamaClient(settings.ollama_url)
+        timeout = settings.summary_timeout
+
+        def work() -> LLMReply:
+            return client.chat(model, messages, timeout)
+
+        def ok(reply: LLMReply) -> None:
+            if self.db.get_session(sid) is None:
+                self._finish_job()
+                return
+            self._store_manual_summary(sid, normalise_summary(reply.text))
+            self._finish_job()
+
+        def err(exc: Exception) -> None:
+            self.status_message.emit(f"Could not create a summary: {exc}")
+            self._finish_job()
+
+        self._run(work, ok, err)
+
+    def _start_manual_conclusions(self, sid: str) -> None:
+        self.status_message.emit("Asking the local model for conclusions…")
+        session = self.db.get_session(sid)
+        if session is None:
+            self._finish_job()
+            return
+        settings = Settings.load(self.db)
+        model = session.ollama_model if session.ollama_model else settings.ollama_model
+        messages = conclusion_messages(self.db.list_turns(sid), cwd=self.cwd)
+        client = OllamaClient(settings.ollama_url)
+        timeout = settings.summary_timeout
+
+        def work() -> LLMReply:
+            return client.chat(model, messages, timeout)
+
+        def ok(reply: LLMReply) -> None:
+            if self.db.get_session(sid) is None:
+                self._finish_job()
+                return
+            self._store_manual_conclusions(sid, parse_conclusion_list(reply.text))
+            self._finish_job()
+
+        def err(exc: Exception) -> None:
+            self.status_message.emit(f"Could not create conclusions: {exc}")
+            self._finish_job()
+
+        self._run(work, ok, err)
+
     # --- shutdown ----------------------------------------------------------
 
     def _start_end(self) -> None:
         job = self._job
         sid = job.session_id if job else None
-        self.shutdown_active.emit(True)
-        self.shutdown_progress.emit("Ending the session…")
+        store_notes = True if job is None else job.store_notes
+        if store_notes:
+            self.shutdown_active.emit(True)
+            self.shutdown_progress.emit("Ending the session…")
         if not sid:
             self._finish_job()
             return
         session = self.db.get_session(sid)
         if session is None or session.status == "closed":
+            self._finish_job()
+            return
+        if not store_notes:
+            self._close_without_notes(sid)
             self._finish_job()
             return
         self.db.update_session(sid, status="closing")
@@ -1038,6 +1296,21 @@ class Orchestrator(QObject):
             self._finish_job()
 
         self._run(work, ok, err)
+
+    def _close_without_notes(self, sid: str) -> None:
+        """Close the session and leave summaries and conclusions unchanged."""
+        turns = self.db.list_turns(sid)
+        if not turns:
+            self.db.delete_session_if_empty(sid)
+            if self.session_id == sid:
+                self.session_id = None
+            self._emit_session()
+            log.info("discarded empty session %s", sid)
+            return
+        self.db.mark_closed(sid)
+        self._emit_session()
+        self.status_message.emit("Session closed without a summary.")
+        log.info("closed session %s without a summary", sid)
 
     def _store_shutdown(self, sid: str, summary: str, conclusions: list[str]) -> None:
         summary_text = normalise_summary(summary)

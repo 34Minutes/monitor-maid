@@ -88,6 +88,23 @@ QTabBar::tab:selected { background: #2c241c; color: #f0d3a8; }
 QScrollBar:vertical { background: #14171d; width: 10px; }
 QScrollBar::handle:vertical { background: #3a4150; border-radius: 4px; }
 QStatusBar { background: #101318; color: #9aa3b2; }
+QMenuBar { background: #1b1f27; color: #e7e9ee; }
+QMenuBar::item:selected { background: #2c241c; }
+QMenu {
+    background: #1b1f27;
+    color: #e7e9ee;
+    border: 1px solid #3c4558;
+}
+QMenu::item { padding: 6px 22px; background: transparent; }
+QMenu::item:selected { background: #8a5a2a; color: #fff8ef; }
+QMenu::item:disabled { color: #6d7582; }
+QListWidget {
+    background: #12151b;
+    color: #e7e9ee;
+    border: 1px solid #2e3440;
+    border-radius: 6px;
+}
+QListWidget::item:selected { background: #3a3328; color: #fff8ef; }
 QCheckBox { background: transparent; spacing: 6px; }
 QFrame#bubble {
     border-radius: 8px;

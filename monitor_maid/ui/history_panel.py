@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QHeaderView,
+    QMenu,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -26,10 +27,14 @@ _FILTERS = (
 
 
 class HistoryPanel(QWidget):
+    new_from_checked = pyqtSignal()
+    view_item = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self._items: list[HistoryItem] = []
         self._checked: set[str] = set()
+        self.can_start = True
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         filters = QHBoxLayout()
@@ -49,6 +54,8 @@ class HistoryPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
         self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table, 1)
 
@@ -83,10 +90,55 @@ class HistoryPanel(QWidget):
         self._checked &= live
         self._rebuild()
 
+    def item_at(self, pos) -> HistoryItem | None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return None
+        return self.item_for_row(row)
+
+    def item_for_row(self, row: int) -> HistoryItem | None:
+        cell = self.table.item(row, 0)
+        if cell is None:
+            return None
+        key = cell.data(Qt.ItemDataRole.UserRole)
+        for item in self._items:
+            if item.key == key:
+                return item
+        return None
+
+    def build_context_menu(self, item: HistoryItem | None) -> QMenu:
+        menu = QMenu(self)
+        start = menu.addAction("New session from checked items")
+        start.setEnabled(self.can_start and bool(self.checked_items()))
+        start.setToolTip("Starts a session from the ticked rows, including rows hidden by a filter.")
+        start.triggered.connect(lambda _checked=False: self.new_from_checked.emit())
+        menu.addSeparator()
+        view_summary = menu.addAction("View summary")
+        view_conclusion = menu.addAction("View conclusion")
+        summary_row = item is not None and item.kind == "summary"
+        conclusion_row = item is not None and item.kind == "conclusion"
+        view_summary.setEnabled(summary_row)
+        view_conclusion.setEnabled(conclusion_row)
+        view_summary.setToolTip(
+            "Open this summary." if summary_row else "Right-click a summary row."
+        )
+        view_conclusion.setToolTip(
+            "Open this conclusion." if conclusion_row else "Right-click a conclusion row."
+        )
+        if summary_row:
+            view_summary.triggered.connect(lambda _checked=False: self.view_item.emit(item))
+        if conclusion_row:
+            view_conclusion.triggered.connect(lambda _checked=False: self.view_item.emit(item))
+        return menu
+
+    def checked_items(self) -> list[HistoryItem]:
+        """Rows whose checkbox is ticked, even if a kind filter is hiding them."""
+        return [item for item in self._items if item.key in self._checked]
+
     def selected_items(self) -> list[HistoryItem]:
         chosen = []
-        for item in self._items:
-            if item.key in self._checked and self._boxes[item.kind].isChecked():
+        for item in self.checked_items():
+            if self._boxes[item.kind].isChecked():
                 chosen.append(item)
         return chosen
 
@@ -109,6 +161,9 @@ class HistoryPanel(QWidget):
                 preview = preview[:137] + "..."
             self.table.setItem(row, 3, QTableWidgetItem(preview))
         self.table.blockSignals(False)
+
+    def _on_context_menu(self, pos) -> None:
+        self.build_context_menu(self.item_at(pos)).exec(self.table.viewport().mapToGlobal(pos))
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:

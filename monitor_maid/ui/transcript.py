@@ -30,6 +30,12 @@ _SPECIAL = {
 
 
 def _role(turn: Turn) -> str:
+    if turn.metadata.get("seed"):
+        source = str(turn.metadata.get("source_kind") or "")
+        if source in {"summary", "grok", "preamble"}:
+            return "summary"
+        if source == "conclusion":
+            return "conclusion"
     if turn.kind in _SPECIAL:
         return turn.kind
     return turn.actor
@@ -99,7 +105,7 @@ class Bubble(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
-        label = display_actor(turn.actor, turn.kind, turn.visible_to_local)
+        label = display_actor(turn.actor, turn.kind, turn.visible_to_local, turn.metadata)
         note = ""
         if not turn.visible_to_local:
             note = "  ·  not visible to the local model"

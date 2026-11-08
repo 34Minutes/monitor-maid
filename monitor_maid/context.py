@@ -195,6 +195,44 @@ def build_review_input(turns: list[Turn], command: str, *, budget: int) -> list[
     ]
 
 
+def seed_records(items: list[HistoryItem]) -> list[tuple[str, str, dict]]:
+    """Turns to plant in a new session so the local model sees a short record.
+
+    Each record is ``(actor, content, metadata)``. Store them as kind
+    ``message`` so later local calls include them. A summary or conclusion
+    stored on the old session stays out of that session's local context.
+    """
+    records: list[tuple[str, str, dict]] = []
+    for item in items:
+        text = (item.content or "").strip()
+        if not text:
+            continue
+        meta = {"seed": True, "source_kind": item.kind, "source_id": item.source_id}
+        if item.kind == "question":
+            records.append(("user", text, meta))
+        elif item.kind == "answer":
+            records.append(("local_llm", text, meta))
+        elif item.kind == "summary":
+            records.append(("user", "Summary of an earlier session:\n\n" + text, meta))
+        elif item.kind == "conclusion":
+            records.append(("user", "Conclusion from an earlier session:\n\n" + text, meta))
+        elif item.kind == "grok":
+            note = scrub_relay(text).strip()
+            if not note:
+                continue
+            records.append(("user", "Note:\n\n" + note, meta))
+    if records and records[0][0] != "user":
+        records.insert(
+            0,
+            (
+                "user",
+                "Continue from the earlier replies below.",
+                {"seed": True, "source_kind": "preamble"},
+            ),
+        )
+    return records
+
+
 def compose_selection_prompt(
     items: list[HistoryItem],
     question: str,

@@ -8,7 +8,7 @@ from monitor_maid.models import CommandRecord, Conclusion, Session, Summary, Tur
 
 
 def _actor_line(turn: Turn) -> str:
-    label = display_actor(turn.actor, turn.kind, turn.visible_to_local)
+    label = display_actor(turn.actor, turn.kind, turn.visible_to_local, turn.metadata)
     note = ""
     if turn.actor == "grok" or (turn.actor == "user" and not turn.visible_to_local):
         note = " (not visible to the local model)"

@@ -19,6 +19,14 @@ def test_schema_session_and_grok_isolation(tmp_path):
     user = db.add_turn(session.id, actor="user", kind="message", content="Explain the three modes in detail please")
     assert user.seq == 1
     assert db.get_session(session.id).title.startswith("Explain the three")
+    db.update_session(session.id, title="Kept name")
+    db.add_turn(
+        session.id,
+        actor="user",
+        kind="message",
+        content="This later question is long enough to have replaced the title",
+    )
+    assert db.get_session(session.id).title == "Kept name"
     grok = db.add_turn(
         session.id,
         actor="grok",
@@ -39,6 +47,47 @@ def test_schema_session_and_grok_isolation(tmp_path):
     reopened = db.reopen_session(session.id)
     assert reopened.status == "open"
     assert db.list_summaries(session.id)[0].content == "A summary"
+    db.close()
+
+
+def test_delete_session_removes_transcript_and_notes(tmp_path):
+    db = Database(tmp_path / "maid.db")
+    db.migrate()
+    session = db.create_session(
+        title="Kept name",
+        execution_mode="manual",
+        auto_limit=4,
+        grok_relay_mode="manual",
+        grok_relay_limit=4,
+        monitor_mode=False,
+        ollama_model="llama3.2",
+    )
+    other = db.create_session(
+        title="Other",
+        execution_mode="manual",
+        auto_limit=4,
+        grok_relay_mode="manual",
+        grok_relay_limit=4,
+        monitor_mode=False,
+        ollama_model="llama3.2",
+    )
+    db.add_turn(session.id, actor="user", kind="message", content="hello")
+    db.add_summary(session.id, "A summary")
+    db.add_conclusion(session.id, "A conclusion")
+    db.set_last_session(session.id)
+    log_file = tmp_path / "proc-test.log"
+    log_file.write_text("output", encoding="utf-8")
+    db.add_process(1, session.id, "echo hi", str(log_file))
+    assert db.delete_session(session.id) is True
+    assert db.get_session(session.id) is None
+    assert db.list_turns(session.id) == []
+    assert db.list_summaries(session.id) == []
+    assert db.list_conclusions(session.id) == []
+    assert db.list_processes() == []
+    assert not log_file.exists()
+    assert db.get_session(other.id) is not None
+    assert db.get_setting("last_session_id", "") == ""
+    assert db.delete_session(session.id) is False
     db.close()
 
 

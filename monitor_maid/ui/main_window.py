@@ -5,14 +5,16 @@ from __future__ import annotations
 import os
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextDocument
+from PyQt6.QtGui import QAction, QTextDocument
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -29,12 +31,20 @@ from monitor_maid.config import Settings, effective_api_key
 from monitor_maid.context import build_history_items
 from monitor_maid.db import Database
 from monitor_maid.export import selection_to_markdown, session_to_html, session_to_markdown, session_to_plaintext
-from monitor_maid.models import MODE_LABELS
+from monitor_maid.models import MODE_LABELS, HistoryItem
 from monitor_maid.orchestrator import Orchestrator
 from monitor_maid.paths import process_log_dir
 from monitor_maid.ui.command_log import CommandLog
 from monitor_maid.ui.composer import Composer
-from monitor_maid.ui.dialogs import AskDialog, RecoveryDialog, SettingsDialog
+from monitor_maid.ui.dialogs import (
+    AskDialog,
+    EndSessionDialog,
+    NoteDialog,
+    NotesBrowser,
+    RecoveryDialog,
+    SettingsDialog,
+    seed_button_label,
+)
 from monitor_maid.ui.history_panel import HistoryPanel
 from monitor_maid.ui.hooks import WindowHooks
 from monitor_maid.ui.transcript import TranscriptView
@@ -49,6 +59,7 @@ class MainWindow(QMainWindow):
         self._quit_done = False
         self._quitting = False
         self._loading = False
+        self._seed_after_new: list[HistoryItem] | None = None
         self.hooks = WindowHooks(lambda: self)
         self.orchestrator = Orchestrator(
             db,
@@ -75,12 +86,16 @@ class MainWindow(QMainWindow):
         self.session_combo = QComboBox()
         self.session_combo.setObjectName("sessionCombo")
         self.session_combo.setMinimumWidth(260)
+        self.rename_button = QPushButton("Rename")
+        self.rename_button.setObjectName("renameSession")
+        self.rename_button.setToolTip("Give this session a name. A name you set is kept.")
         self.new_button = QPushButton("New")
         self.end_button = QPushButton("End session")
         self.reopen_button = QPushButton("Reopen")
         self.settings_button = QPushButton("Settings")
         row1.addWidget(QLabel("Session"))
         row1.addWidget(self.session_combo, 1)
+        row1.addWidget(self.rename_button)
         row1.addWidget(self.new_button)
         row1.addWidget(self.end_button)
         row1.addWidget(self.reopen_button)
@@ -156,17 +171,21 @@ class MainWindow(QMainWindow):
         self.composer = Composer()
         left_layout.addWidget(legend)
         left_layout.addWidget(self.transcript, 1)
-        left_layout.addWidget(self.closed_banner)
-        left_layout.addWidget(self.ollama_hint)
-        left_layout.addWidget(self.pending_label)
-        left_layout.addWidget(self.composer)
         self.history = HistoryPanel()
         self.commands = CommandLog()
         tabs = QTabWidget()
         tabs.addTab(self.history, "History")
         tabs.addTab(self.commands, "Commands")
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(tabs, 1)
+        right_layout.addWidget(self.closed_banner)
+        right_layout.addWidget(self.ollama_hint)
+        right_layout.addWidget(self.pending_label)
+        right_layout.addWidget(self.composer)
         splitter.addWidget(left)
-        splitter.addWidget(tabs)
+        splitter.addWidget(right)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter, 1)
@@ -190,6 +209,34 @@ class MainWindow(QMainWindow):
         self.progress.reset()
         self.progress.hide()
         self.closed_banner.hide()
+        self._build_menus()
+
+    def _build_menus(self) -> None:
+        menu = self.menuBar().addMenu("Session")
+        self.act_rename = QAction("Rename session…", self)
+        self.act_rename.setObjectName("renameSessionAction")
+        self.act_create_summary = QAction("Create summary", self)
+        self.act_create_summary.setObjectName("createSummary")
+        self.act_create_conclusions = QAction("Create conclusions", self)
+        self.act_create_conclusions.setObjectName("createConclusions")
+        self.act_browse = QAction("Browse sessions…", self)
+        self.act_browse.setObjectName("browseNotes")
+        self.act_view_summary = QAction("View summary", self)
+        self.act_view_summary.setObjectName("viewSummary")
+        self.act_view_conclusion = QAction("View conclusion", self)
+        self.act_view_conclusion.setObjectName("viewConclusion")
+        self.act_from_checked = QAction("New session from checked items", self)
+        self.act_from_checked.setObjectName("newFromChecked")
+        menu.addAction(self.act_rename)
+        menu.addSeparator()
+        menu.addAction(self.act_create_summary)
+        menu.addAction(self.act_create_conclusions)
+        menu.addSeparator()
+        menu.addAction(self.act_browse)
+        menu.addAction(self.act_view_summary)
+        menu.addAction(self.act_view_conclusion)
+        menu.addSeparator()
+        menu.addAction(self.act_from_checked)
 
     def _wire(self) -> None:
         orch = self.orchestrator
@@ -206,6 +253,8 @@ class MainWindow(QMainWindow):
         orch.shutdown_active.connect(self._show_shutdown)
         orch.shutdown_progress.connect(self.progress.setLabelText)
         self.session_combo.currentIndexChanged.connect(self._session_picked)
+        self.rename_button.clicked.connect(self._rename_session)
+        self.act_rename.triggered.connect(self._rename_session)
         self.new_button.clicked.connect(self._new_session)
         self.end_button.clicked.connect(self._end_session)
         self.reopen_button.clicked.connect(self.orchestrator.reopen_current)
@@ -224,6 +273,14 @@ class MainWindow(QMainWindow):
         self.history.ask_grok.clicked.connect(self._ask_grok)
         self.history.ask_local.clicked.connect(self._ask_local)
         self.history.verify.clicked.connect(self._verify)
+        self.history.new_from_checked.connect(self._new_from_checked)
+        self.history.view_item.connect(self._view_history_item)
+        self.act_create_summary.triggered.connect(self._create_summary)
+        self.act_create_conclusions.triggered.connect(self._create_conclusions)
+        self.act_browse.triggered.connect(self._browse_notes)
+        self.act_view_summary.triggered.connect(lambda: self._view_latest("summary"))
+        self.act_view_conclusion.triggered.connect(lambda: self._view_latest("conclusion"))
+        self.act_from_checked.triggered.connect(self._new_from_checked)
         self.progress.canceled.connect(self.orchestrator.cancel_shutdown)
 
     def _startup(self) -> None:
@@ -334,6 +391,21 @@ class MainWindow(QMainWindow):
         if sid and sid != self.orchestrator.session_id:
             self.orchestrator.select_session(str(sid))
 
+    def _rename_session(self) -> None:
+        session = self.orchestrator.current()
+        if session is None:
+            self.status_label.setText("Open a session first.")
+            return
+        text, ok = QInputDialog.getText(
+            self,
+            "Rename session",
+            "Name for this session:",
+            QLineEdit.EchoMode.Normal,
+            session.title,
+        )
+        if ok:
+            self.orchestrator.rename_session(text)
+
     def _new_session(self) -> None:
         session = self.orchestrator.current()
         if session and session.status == "open":
@@ -361,19 +433,182 @@ class MainWindow(QMainWindow):
         self.orchestrator.accepting_changed.emit(True)
         self.orchestrator.new_session()
 
+    def _create_summary(self) -> None:
+        self.orchestrator.request_summary()
+
+    def _create_conclusions(self) -> None:
+        self.orchestrator.request_conclusions()
+
+    def _browse_notes(self) -> None:
+        protected = None
+        if self.orchestrator.busy or not self.orchestrator.accepting:
+            protected = self.orchestrator.session_id
+        dialog = NotesBrowser(
+            self.db,
+            self,
+            current_id=self.orchestrator.session_id,
+            protected_id=protected,
+        )
+        accepted = bool(dialog.exec())
+        self._apply_deleted_sessions(dialog.deleted_ids)
+        if accepted and dialog.seed_item is not None:
+            self._start_from_items([dialog.seed_item])
+
+    def _apply_deleted_sessions(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        if self.orchestrator.session_id in ids:
+            self.orchestrator.session_id = None
+            sessions = self.db.list_sessions()
+            if sessions:
+                self.orchestrator.select_session(sessions[0].id)
+            else:
+                self.orchestrator.new_session()
+            return
+        self._reload_sessions()
+
+    def _view_latest(self, kind: str) -> None:
+        session = self.orchestrator.current()
+        if session is None:
+            QMessageBox.information(self, "History", "Open a session first.")
+            return
+        items = [
+            item
+            for item in build_history_items(
+                [],
+                self.db.list_summaries(session.id),
+                self.db.list_conclusions(session.id),
+            )
+            if item.kind == kind
+        ]
+        title = "Summary" if kind == "summary" else "Conclusion"
+        if not items:
+            QMessageBox.information(self, title, f"This session has no {kind} yet.")
+            return
+        if kind == "conclusion":
+            body = "\n".join(f"- {item.content}" for item in items)
+            label = (
+                "Start a new session with this conclusion"
+                if len(items) == 1
+                else "Start a new session with these conclusions"
+            )
+            heading = (
+                "Conclusion stored in this session."
+                if len(items) == 1
+                else f"{len(items)} conclusions stored in this session."
+            )
+            self._show_notes(
+                items,
+                title="Conclusion" if len(items) == 1 else "Conclusions",
+                heading=heading,
+                body=body,
+                seed_label=label,
+            )
+            return
+        heading = "Latest summary in this session."
+        if len(items) > 1:
+            heading = (
+                f"Latest of {len(items)} summaries in this session. "
+                "Browse sessions to see the earlier ones."
+            )
+        self._show_note(items[-1], heading=heading)
+
+    def _view_history_item(self, item: object) -> None:
+        if not isinstance(item, HistoryItem):
+            return
+        title = "Summary" if item.kind == "summary" else "Conclusion"
+        self._show_note(item, heading=f"{title} from this session.")
+
+    def _show_note(self, item: HistoryItem, *, heading: str) -> None:
+        title = "Summary" if item.kind == "summary" else "Conclusion"
+        self._show_notes(
+            [item],
+            title=title,
+            heading=heading,
+            body=item.content,
+            seed_label=seed_button_label(item.kind),
+        )
+
+    def _show_notes(
+        self,
+        items: list[HistoryItem],
+        *,
+        title: str,
+        heading: str,
+        body: str,
+        seed_label: str,
+    ) -> None:
+        dialog = NoteDialog(title, heading, body, seed_label, self)
+        if dialog.exec() and dialog.seed:
+            self._start_from_items(items)
+
+    def _new_from_checked(self) -> None:
+        items = self.history.checked_items()
+        if not items:
+            QMessageBox.information(
+                self,
+                "History",
+                "Tick at least one history row. The new session contains only those rows.",
+            )
+            return
+        self._start_from_items(items)
+
+    def _start_from_items(self, items: list[HistoryItem]) -> None:
+        if self.orchestrator.busy or not self.orchestrator.accepting:
+            self.status_label.setText("Wait for the current reply before starting a new session.")
+            return
+        held = list(items)
+        session = self.orchestrator.current()
+        if session and session.status == "open" and self.db.list_turns(session.id):
+            box = QMessageBox(self)
+            box.setWindowTitle("New session")
+            box.setText(
+                "This session is still open. The new session will contain only what you chose."
+            )
+            leave = box.addButton("Leave it open", QMessageBox.ButtonRole.AcceptRole)
+            end_first = box.addButton("End it first", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is end_first:
+                self._seed_after_new = held
+                self.orchestrator.request_end(self._end_then_seed)
+                return
+            if clicked is not leave:
+                return
+        self._plant_in_fresh_session(held)
+
+    def _end_then_seed(self) -> None:
+        self.orchestrator.accepting = True
+        self.orchestrator.accepting_changed.emit(True)
+        items = self._seed_after_new or []
+        self._seed_after_new = None
+        self.orchestrator.new_session()
+        self.orchestrator.plant_seed(items)
+        self.composer.local_edit.setFocus()
+
+    def _plant_in_fresh_session(self, items: list[HistoryItem]) -> None:
+        session = self.orchestrator.current()
+        reuse = (
+            session is not None
+            and session.status == "open"
+            and not self.db.list_turns(session.id)
+        )
+        if not reuse:
+            self.orchestrator.new_session()
+        if self.orchestrator.plant_seed(items):
+            self.composer.local_edit.setFocus()
+
     def _end_session(self) -> None:
         session = self.orchestrator.current()
         if session is None or session.status != "open":
             return
-        confirm = QMessageBox.question(
-            self,
-            "End session",
-            "End this session? Monitor Maid will ask the local model for a summary "
-            "and any conclusions. A very short session skips that call.",
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        self.orchestrator.request_end(self._after_end)
+        dialog = EndSessionDialog(self)
+        dialog.exec()
+        if dialog.choice == "yes":
+            self.orchestrator.request_end(self._after_end)
+        elif dialog.choice == "no":
+            self.orchestrator.request_end(self._after_end, store_notes=False)
 
     def _after_end(self) -> None:
         self.orchestrator.accepting = True
@@ -575,15 +810,23 @@ class MainWindow(QMainWindow):
         self.ollama_hint.show()
 
     def _show_busy(self, busy: bool) -> None:
-        self.session_combo.setEnabled(not busy and self.orchestrator.accepting)
-        self.new_button.setEnabled(not busy and self.orchestrator.accepting)
+        self._set_session_actions(not busy and self.orchestrator.accepting)
 
     def _apply_accepting(self, accepting: bool) -> None:
         session = self.orchestrator.current()
         open_session = session is not None and session.status == "open"
         self.composer.set_enabled(accepting and open_session)
         self.end_button.setEnabled(accepting and open_session)
+        self._set_session_actions(accepting and not self.orchestrator.busy)
         self._apply_grok_gate()
+
+    def _set_session_actions(self, enabled: bool) -> None:
+        self.session_combo.setEnabled(enabled)
+        self.new_button.setEnabled(enabled)
+        self.history.can_start = enabled
+        self.act_create_summary.setEnabled(enabled)
+        self.act_create_conclusions.setEnabled(enabled)
+        self.act_from_checked.setEnabled(enabled)
 
     def _show_shutdown(self, active: bool) -> None:
         self.progress.blockSignals(True)

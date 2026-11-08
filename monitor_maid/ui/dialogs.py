@@ -14,16 +14,27 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from monitor_maid.config import Settings, effective_api_key, env_key_set
-from monitor_maid.models import MODE_LABELS, ApprovalRequest, ApprovalResult, ForwardRequest
+from monitor_maid.context import build_history_items
+from monitor_maid.db import Database
+from monitor_maid.models import (
+    MODE_LABELS,
+    ApprovalRequest,
+    ApprovalResult,
+    ForwardRequest,
+    HistoryItem,
+)
 from monitor_maid.ollama_client import OllamaClient
 from monitor_maid.policy import compile_denylist
 from monitor_maid.xai_client import XAIClient
@@ -60,6 +71,49 @@ class RecoveryDialog(QDialog):
     def _pick(self, choice: str) -> None:
         self.choice = choice
         self.accept()
+
+
+class EndSessionDialog(QDialog):
+    """Cancel leaves the session open. Yes stores notes. No closes without them."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("End session")
+        self.choice = "cancel"
+        self.resize(480, 180)
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            "End this session and store a summary and conclusions?\n\n"
+            "Yes asks the local model, unless the session is very short. "
+            "No closes it and does not store a summary or conclusions. "
+            "Cancel leaves it open."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        row = QHBoxLayout()
+        self.cancel_button = QPushButton("Cancel")
+        self.yes_button = QPushButton("Yes")
+        self.yes_button.setObjectName("primary")
+        self.yes_button.setDefault(True)
+        self.no_button = QPushButton("No")
+        row.addWidget(self.cancel_button)
+        row.addWidget(self.yes_button)
+        row.addWidget(self.no_button)
+        layout.addLayout(row)
+        self.cancel_button.clicked.connect(lambda: self._pick("cancel"))
+        self.yes_button.clicked.connect(lambda: self._pick("yes"))
+        self.no_button.clicked.connect(lambda: self._pick("no"))
+
+    def _pick(self, choice: str) -> None:
+        self.choice = choice
+        if choice == "cancel":
+            self.reject()
+        else:
+            self.accept()
+
+    def reject(self) -> None:  # noqa: N802
+        self.choice = "cancel"
+        super().reject()
 
 
 class AskDialog(QDialog):
@@ -461,3 +515,219 @@ class SettingsDialog(QDialog):
             self.model_note.setText(message)
         if not quiet:
             QMessageBox.information(self, "Connection", message)
+
+
+def seed_button_label(kind: str) -> str:
+    if kind == "summary":
+        return "Start a new session with this summary"
+    return "Start a new session with this conclusion"
+
+
+class NoteDialog(QDialog):
+    """Read-only summary or conclusion, with a way to continue from that text alone."""
+
+    def __init__(self, title: str, heading: str, body: str, seed_label: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.seed = False
+        self.resize(640, 440)
+        layout = QVBoxLayout(self)
+        label = QLabel(heading)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.view = QPlainTextEdit(body)
+        self.view.setReadOnly(True)
+        layout.addWidget(self.view, 1)
+        row = QHBoxLayout()
+        self.seed_button = QPushButton(seed_label)
+        self.seed_button.setObjectName("primary")
+        close = QPushButton("Close")
+        row.addWidget(self.seed_button)
+        row.addStretch(1)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self.seed_button.clicked.connect(self._take)
+        close.clicked.connect(self.reject)
+
+    def _take(self) -> None:
+        self.seed = True
+        self.accept()
+
+
+class NotesBrowser(QDialog):
+    """Every session, and the summaries and conclusions stored on it."""
+
+    def __init__(
+        self,
+        db: Database,
+        parent=None,
+        current_id: str | None = None,
+        protected_id: str | None = None,
+    ):
+        super().__init__(parent)
+        self.db = db
+        self.seed_item: HistoryItem | None = None
+        self.deleted_ids: list[str] = []
+        self.protected_id = protected_id
+        self._sessions = []
+        self._note_items: list[HistoryItem] = []
+        self.setWindowTitle("Summaries and conclusions")
+        self.resize(880, 520)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Each session keeps the summaries and conclusions stored for it. "
+            "Open one to start a new session from that text, or delete a session."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.sessions = QListWidget()
+        self.notes = QListWidget()
+        self.sessions.setMinimumWidth(280)
+        split.addWidget(self.sessions)
+        split.addWidget(self.notes)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 2)
+        layout.addWidget(split, 1)
+        self.detail = QLabel("Select a session.")
+        self.detail.setObjectName("muted")
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        row = QHBoxLayout()
+        self.view_button = QPushButton("View")
+        self.view_button.setEnabled(False)
+        self.delete_button = QPushButton("Delete session")
+        self.delete_button.setObjectName("danger")
+        self.delete_button.setEnabled(False)
+        self.delete_button.setToolTip("Remove this session, its transcript, and its notes.")
+        close = QPushButton("Close")
+        row.addWidget(self.view_button)
+        row.addWidget(self.delete_button)
+        row.addStretch(1)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self.delete_button.clicked.connect(self._delete_selected)
+        self.sessions.currentRowChanged.connect(self._session_picked)
+        self.notes.currentRowChanged.connect(self._note_picked)
+        self.notes.itemDoubleClicked.connect(lambda _item: self._view())
+        self.view_button.clicked.connect(self._view)
+        close.clicked.connect(self.reject)
+        self.current_id = current_id
+        self._load(current_id)
+
+    def _load(self, current_id: str | None) -> None:
+        self._sessions = self.db.list_sessions()
+        self.sessions.clear()
+        select = 0
+        for index, session in enumerate(self._sessions):
+            stamp = session.updated_at[:16].replace("T", " ")
+            item = QListWidgetItem(f"{session.title}   ·   {session.status}   ·   {stamp}")
+            item.setData(Qt.ItemDataRole.UserRole, session.id)
+            self.sessions.addItem(item)
+            if current_id and session.id == current_id:
+                select = index
+        if self._sessions:
+            self.sessions.setCurrentRow(select)
+        else:
+            self.detail.setText("No sessions yet.")
+            self.delete_button.setEnabled(False)
+            self.view_button.setEnabled(False)
+
+    def _session_picked(self, row: int) -> None:
+        self.notes.clear()
+        self._note_items = []
+        self.view_button.setEnabled(False)
+        if row < 0 or row >= len(self._sessions):
+            self.delete_button.setEnabled(False)
+            return
+        session = self._sessions[row]
+        blocked = session.id == self.protected_id
+        self.delete_button.setEnabled(not blocked)
+        self.delete_button.setToolTip(
+            "Wait for the current reply before deleting this session."
+            if blocked
+            else "Remove this session, its transcript, and its notes."
+        )
+        self._note_items = build_history_items(
+            [],
+            self.db.list_summaries(session.id),
+            self.db.list_conclusions(session.id),
+        )
+        summaries = sum(1 for item in self._note_items if item.kind == "summary")
+        conclusions = sum(1 for item in self._note_items if item.kind == "conclusion")
+
+        def counted(count: int, word: str) -> str:
+            return f"{count} {word}" + ("" if count == 1 else "s")
+
+        self.detail.setText(
+            f"“{session.title}”  ·  {session.status}  ·  "
+            f"{counted(summaries, 'summary')}, {counted(conclusions, 'conclusion')}."
+        )
+        for item in self._note_items:
+            when = item.created_at[11:16] if len(item.created_at) >= 16 else item.created_at
+            preview = " ".join(item.content.split())
+            if len(preview) > 90:
+                preview = preview[:87] + "..."
+            label = "Summary" if item.kind == "summary" else "Conclusion"
+            self.notes.addItem(QListWidgetItem(f"{label}   {when}   {preview}"))
+        if self._note_items:
+            self.notes.setCurrentRow(0)
+
+    def _delete_selected(self) -> None:
+        row = self.sessions.currentRow()
+        if row < 0 or row >= len(self._sessions):
+            return
+        session = self._sessions[row]
+        if session.id == self.protected_id:
+            self.detail.setText("Wait for the current reply before deleting this session.")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete session")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"Delete “{session.title}”?")
+        detail = "This removes the transcript, summaries, and conclusions for that session."
+        if session.id == self.current_id:
+            detail += " This is the session open in the window."
+        box.setInformativeText(detail)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        delete = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not delete:
+            return
+        self._remove_session(session.id)
+
+    def _remove_session(self, session_id: str) -> None:
+        index = next((i for i, session in enumerate(self._sessions) if session.id == session_id), -1)
+        if index < 0:
+            return
+        if not self.db.delete_session(session_id):
+            self.detail.setText("That session is already gone.")
+            self._load(self.current_id)
+            return
+        self.deleted_ids.append(session_id)
+        if self.current_id == session_id:
+            self.current_id = None
+        remaining = [session.id for session in self._sessions if session.id != session_id]
+        next_id = remaining[min(index, len(remaining) - 1)] if remaining else None
+        self._load(next_id)
+
+    def _note_picked(self, row: int) -> None:
+        self.view_button.setEnabled(0 <= row < len(self._note_items))
+
+    def _view(self) -> None:
+        row = self.notes.currentRow()
+        if row < 0 or row >= len(self._note_items):
+            return
+        item = self._note_items[row]
+        title = "Summary" if item.kind == "summary" else "Conclusion"
+        dialog = NoteDialog(
+            title,
+            f"{title} stored on this session.",
+            item.content,
+            seed_button_label(item.kind),
+            self,
+        )
+        if dialog.exec() and dialog.seed:
+            self.seed_item = item
+            self.accept()

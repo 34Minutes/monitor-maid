@@ -254,6 +254,44 @@ class Database:
         self._conn.commit()
         return True
 
+    def delete_session(self, session_id: str) -> bool:
+        """Remove a session and the transcript, notes, and command rows stored on it."""
+        if self.get_session(session_id) is None:
+            return False
+        logs = [
+            row["log_path"]
+            for row in self._conn.execute(
+                "SELECT log_path FROM processes WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        ]
+        try:
+            for table in ("commands", "turns", "summaries", "conclusions", "processes"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE session_id = ?",
+                    (session_id,),
+                )
+            deleted = self._conn.execute(
+                "DELETE FROM sessions WHERE id = ?",
+                (session_id,),
+            ).rowcount
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if not deleted:
+            return False
+        for path in logs:
+            try:
+                file = Path(path)
+                if file.is_file():
+                    file.unlink()
+            except OSError:
+                pass
+        if self.get_setting("last_session_id", "") == session_id:
+            self.set_setting("last_session_id", "")
+        return True
+
     def mark_closed(self, session_id: str) -> Session:
         return self.update_session(session_id, status="closed", closed_at=utc_now())
 
@@ -321,6 +359,9 @@ class Database:
         ).fetchall()
         return [_turn(row) for row in rows]
 
+    def get_turn(self, turn_id: str) -> Turn | None:
+        return self._get_turn(turn_id)
+
     def add_summary(self, session_id: str, content: str) -> Summary:
         now = utc_now()
         summary_id = _new_id()
@@ -343,6 +384,19 @@ class Database:
             id=conclusion_id, session_id=session_id, content=content, created_at=now
         )
 
+    def get_summary(self, summary_id: str) -> Summary | None:
+        row = self._conn.execute(
+            "SELECT * FROM summaries WHERE id = ?", (summary_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return Summary(
+            id=row["id"],
+            session_id=row["session_id"],
+            content=row["content"],
+            created_at=row["created_at"],
+        )
+
     def list_summaries(self, session_id: str) -> list[Summary]:
         rows = self._conn.execute(
             "SELECT * FROM summaries WHERE session_id = ? ORDER BY created_at ASC",
@@ -357,6 +411,19 @@ class Database:
             )
             for row in rows
         ]
+
+    def get_conclusion(self, conclusion_id: str) -> Conclusion | None:
+        row = self._conn.execute(
+            "SELECT * FROM conclusions WHERE id = ?", (conclusion_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return Conclusion(
+            id=row["id"],
+            session_id=row["session_id"],
+            content=row["content"],
+            created_at=row["created_at"],
+        )
 
     def list_conclusions(self, session_id: str) -> list[Conclusion]:
         rows = self._conn.execute(

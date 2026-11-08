@@ -17,7 +17,25 @@ MODE_LABELS = {
 }
 
 
-def display_actor(actor: str, kind: str, visible_to_local: bool) -> str:
+def display_actor(
+    actor: str,
+    kind: str,
+    visible_to_local: bool,
+    metadata: dict | None = None,
+) -> str:
+    if metadata and metadata.get("seed"):
+        source = str(metadata.get("source_kind") or "")
+        if source == "summary":
+            return "Carried summary"
+        if source == "conclusion":
+            return "Carried conclusion"
+        if source == "grok":
+            return "Carried note"
+        if source == "answer" or actor == "local_llm":
+            return "Earlier reply"
+        if source == "question":
+            return "Earlier question"
+        return "Carried in"
     if kind == "summary":
         return "Summary"
     if kind == "conclusion":
@@ -181,6 +199,7 @@ class Job:
     session_id: str | None = None
     on_done: Callable[[], None] | None = None
     reply_kind: str = "message"
+    store_notes: bool = True
 
 
 @dataclass

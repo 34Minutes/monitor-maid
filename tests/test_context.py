@@ -5,10 +5,11 @@ from monitor_maid.context import (
     compose_selection_prompt,
     format_transcript,
     parse_conclusion_list,
+    seed_records,
     shutdown_plan,
     summary_messages,
 )
-from monitor_maid.models import NO_SUBSTANTIAL, Conclusion, HistoryItem, Summary, Turn
+from monitor_maid.models import NO_SUBSTANTIAL, Conclusion, HistoryItem, Summary, Turn, display_actor
 
 
 def _turn(**kwargs) -> Turn:
@@ -122,3 +123,47 @@ def test_history_items_and_local_selection_hides_grok_label():
     assert "Grok:" not in prompt
     assert "[note " in prompt
     assert "check the logs" in prompt
+
+
+def test_seed_records_are_local_messages_and_hide_grok_attribution():
+    items = [
+        HistoryItem("q", "question", "user", "t1", "What is in the home directory?", "q"),
+        HistoryItem("a", "answer", "local_llm", "t2", "A listing was produced.", "a"),
+        HistoryItem("s", "summary", "local_llm", "t3", "The user listed the home directory.", "s"),
+        HistoryItem("c", "conclusion", "local_llm", "t4", "The listing was approved.", "c"),
+        HistoryItem("g", "grok", "grok", "t5", "Grok: look at the listing", "g"),
+    ]
+    records = seed_records(items)
+    assert [actor for actor, _content, _meta in records] == ["user", "local_llm", "user", "user", "user"]
+    blob = "\n".join(content for _actor, content, _meta in records)
+    assert "What is in the home directory?" in blob
+    assert "Summary of an earlier session:" in blob
+    assert "Conclusion from an earlier session:" in blob
+    assert "Note:" in blob
+    assert "look at the listing" in blob
+    assert "Grok:" not in blob
+    assert all(meta.get("seed") for _actor, _content, meta in records)
+    turns = [
+        _turn(
+            id=str(index),
+            seq=index,
+            actor=actor,
+            kind="message",
+            content=content,
+            metadata=meta,
+        )
+        for index, (actor, content, meta) in enumerate(records, start=1)
+    ]
+    messages = build_local_messages(turns)
+    sent = "\n".join(message["content"] for message in messages)
+    assert "home directory" in sent
+    assert "Grok:" not in sent
+    assert display_actor("user", "message", True, {"seed": True, "source_kind": "summary"}) == (
+        "Carried summary"
+    )
+    answer_only = seed_records(
+        [HistoryItem("a", "answer", "local_llm", "t2", "Only the reply.", "a")]
+    )
+    assert answer_only[0][0] == "user"
+    assert answer_only[0][1] == "Continue from the earlier replies below."
+    assert answer_only[1][0] == "local_llm"
