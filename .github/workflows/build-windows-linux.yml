@@ -1,0 +1,82 @@
+name: Build Windows and Linux
+
+on:
+  push:
+    tags:
+      - "ALPHA_*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build
+        run: python -m PyInstaller --noconfirm --clean monitor-maid.spec
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            asset="MonitorMaid-${GITHUB_REF_NAME}-windows-amd64.zip"
+            tar -a -cf "${asset}" -C dist monitor-maid
+          else
+            asset="MonitorMaid-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+            tar -czf "${asset}" -C dist monitor-maid
+          fi
+          test -s "${asset}"
+          echo "ASSET=${asset}" >> "${GITHUB_ENV}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitor-maid-${{ runner.os }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    name: Attach executables to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: monitor-maid-*
+          merge-multiple: true
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find release-assets -type f | sort)
+          test "${#files[@]}" -ge 2
+          printf 'Attaching:\n'
+          printf '  %s\n' "${files[@]}"
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "Monitor Maid ${GITHUB_REF_NAME}" \
+              --notes "Windows and Linux builds. Unzip or untar and run monitor-maid. Ollama is installed separately. Python is bundled."
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber

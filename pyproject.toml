@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monitor-maid"
+version = "0.1.0"
+description = "Desktop wrapper for a local Ollama model, with gated host commands and optional Grok review."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PyQt6>=6.6",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+monitor-maid = "monitor_maid.app:main"
+
+[tool.setuptools.packages.find]
+include = ["monitor_maid*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
