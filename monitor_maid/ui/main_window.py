@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from monitor_maid.config import Settings
+from monitor_maid.config import Settings, effective_api_key
 from monitor_maid.context import build_history_items
 from monitor_maid.db import Database
 from monitor_maid.export import selection_to_markdown, session_to_html, session_to_markdown, session_to_plaintext
@@ -97,10 +97,11 @@ class MainWindow(QMainWindow):
             self.relay_mode.addItem(label, mode)
         self.monitor_button = QPushButton("Monitor mode")
         self.monitor_button.setCheckable(True)
-        self.monitor_button.setToolTip(
+        self._monitor_tip = (
             "Show a box where you can write to Grok yourself. "
             "Grok sees the local transcript. The local model does not see your note or Grok's reply."
         )
+        self.monitor_button.setToolTip(self._monitor_tip)
         self.export_button = QPushButton("Export")
         self.print_button = QPushButton("Print")
         self.retry_button = QPushButton("Retry")
@@ -148,10 +149,15 @@ class MainWindow(QMainWindow):
         self.pending_label = QLabel("")
         self.pending_label.setObjectName("muted")
         self.pending_label.setWordWrap(True)
+        self.ollama_hint = QLabel("")
+        self.ollama_hint.setObjectName("warning")
+        self.ollama_hint.setWordWrap(True)
+        self.ollama_hint.hide()
         self.composer = Composer()
         left_layout.addWidget(legend)
         left_layout.addWidget(self.transcript, 1)
         left_layout.addWidget(self.closed_banner)
+        left_layout.addWidget(self.ollama_hint)
         left_layout.addWidget(self.pending_label)
         left_layout.addWidget(self.composer)
         self.history = HistoryPanel()
@@ -294,6 +300,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Monitor Maid — {session.title}")
         self.status_label.setText(f"{session.status}  ·  {model}")
         self._loading = False
+        self._apply_grok_gate()
         self._reload_transcript()
         self._reload_commands()
 
@@ -541,8 +548,31 @@ class MainWindow(QMainWindow):
         self.pending_label.setText(f"Queued: {preview}{extra}")
         self.pending_label.show()
 
+    def _apply_grok_gate(self) -> None:
+        ready = bool(effective_api_key(Settings.load(self.db)))
+        missing = "Add an xAI API key in Settings, or set XAI_API_KEY."
+        self.composer.set_grok_available(ready)
+        self.monitor_button.setEnabled(ready)
+        self.monitor_button.setToolTip(self._monitor_tip if ready else missing)
+        self.relay_mode.setEnabled(ready)
+        self.relay_limit.setEnabled(ready)
+        self.relay_mode.setToolTip("" if ready else missing)
+        self.relay_limit.setToolTip("" if ready else missing)
+        self.history.set_grok_enabled(ready)
+
     def _show_ollama(self, status: str) -> None:
-        self.ollama_label.setText(f"Ollama: {status}")
+        hints = {
+            "offline": "Ollama is not running. Start it with `ollama serve`, then try again.",
+            "timeout": "Ollama did not answer in time. Check that `ollama serve` is still running.",
+        }
+        if status == "online":
+            self.ollama_label.setText("Ollama: online")
+            self.ollama_hint.hide()
+            return
+        text = hints.get(status, f"Ollama: {status}")
+        self.ollama_label.setText(text)
+        self.ollama_hint.setText(text)
+        self.ollama_hint.show()
 
     def _show_busy(self, busy: bool) -> None:
         self.session_combo.setEnabled(not busy and self.orchestrator.accepting)
@@ -553,6 +583,7 @@ class MainWindow(QMainWindow):
         open_session = session is not None and session.status == "open"
         self.composer.set_enabled(accepting and open_session)
         self.end_button.setEnabled(accepting and open_session)
+        self._apply_grok_gate()
 
     def _show_shutdown(self, active: bool) -> None:
         self.progress.blockSignals(True)

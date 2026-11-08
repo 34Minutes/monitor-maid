@@ -134,6 +134,8 @@ class ApprovalDialog(QDialog):
         self.approve_button = QPushButton("Approve")
         self.approve_button.setObjectName("primary")
         self.review_button.setEnabled(request.allow_review)
+        if not request.allow_review:
+            self.review_button.setToolTip("Add an xAI API key in Settings, or set XAI_API_KEY.")
         if request.blocked:
             self.approve_button.setEnabled(False)
             self.review_button.setEnabled(False)
@@ -332,11 +334,13 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.denylist, 1)
         probes = QHBoxLayout()
         test_ollama = QPushButton("Test Ollama")
-        test_xai = QPushButton("Test xAI")
+        self.test_xai = QPushButton("Test xAI")
         test_ollama.clicked.connect(self._test_ollama)
-        test_xai.clicked.connect(self._test_xai)
+        self.test_xai.clicked.connect(self._test_xai)
+        self.xai_key.textChanged.connect(self._apply_xai_key_state)
+        self._apply_xai_key_state()
         probes.addWidget(test_ollama)
-        probes.addWidget(test_xai)
+        probes.addWidget(self.test_xai)
         probes.addStretch(1)
         layout.addLayout(probes)
         buttons = QDialogButtonBox(
@@ -374,6 +378,19 @@ class SettingsDialog(QDialog):
         )
         settings.save(self.db)
         self.accept()
+
+    def _apply_xai_key_state(self) -> None:
+        ready = env_key_set() or bool(self.xai_key.text().strip())
+        tip = "" if ready else "Enter an xAI API key, or set XAI_API_KEY."
+        for widget in (
+            self.test_xai,
+            self.review_first,
+            self.monitor_default,
+            self.relay_mode,
+            self.relay_limit,
+        ):
+            widget.setEnabled(ready)
+            widget.setToolTip(tip)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)

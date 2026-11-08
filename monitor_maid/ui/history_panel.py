@@ -70,6 +70,13 @@ class HistoryPanel(QWidget):
         self.all_button.clicked.connect(self._select_shown)
         self.none_button.clicked.connect(self._clear)
 
+    def set_grok_enabled(self, enabled: bool) -> None:
+        tip = "" if enabled else "Add an xAI API key in Settings, or set XAI_API_KEY."
+        self.ask_grok.setEnabled(enabled)
+        self.verify.setEnabled(enabled)
+        self.ask_grok.setToolTip(tip)
+        self.verify.setToolTip(tip)
+
     def set_items(self, items: list[HistoryItem]) -> None:
         self._items = list(items)
         live = {item.key for item in items}

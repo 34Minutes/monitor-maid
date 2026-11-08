@@ -79,11 +79,17 @@ class Composer(QFrame):
         self.both_button = QPushButton("Send to both")
         self.hint = QLabel("⌘/Ctrl+Enter sends the focused pane. ⌘/Ctrl+Shift+Enter sends both.")
         self.hint.setObjectName("muted")
-        self.grok_hint = QLabel(
+        self._grok_hint_ready = (
             "To ask Grok something of your own, turn on Monitor mode and type in the Grok box. "
             "That exchange stays off the local model's record. "
             "History → Ask Grok is only for items you have checked."
         )
+        self._grok_hint_nokey = (
+            "Grok is off because there is no API key. "
+            "Add one in Settings, or set XAI_API_KEY, and save. "
+            "Grok buttons stay disabled until a key is available."
+        )
+        self.grok_hint = QLabel(self._grok_hint_ready)
         self.grok_hint.setObjectName("muted")
         self.grok_hint.setWordWrap(True)
         buttons.addWidget(self.local_button)
@@ -101,23 +107,46 @@ class Composer(QFrame):
         self.grok_edit.send.connect(self._send_grok)
         self.local_edit.send_both.connect(self._send_both)
         self.grok_edit.send_both.connect(self._send_both)
+        self._monitor = False
+        self._grok_available = True
+        self._inputs_enabled = True
         self.set_monitor(False)
 
     def set_monitor(self, enabled: bool) -> None:
+        self._monitor = enabled
         for widget in self._grok_col_widgets:
             widget.setVisible(enabled)
         self.grok_button.setVisible(enabled)
         self.both_button.setVisible(enabled)
         self.hint.setVisible(enabled)
-        self.grok_hint.setVisible(not enabled)
         self.local_button.setText("Send to local" if enabled else "Send")
+        self._refresh_grok_hint()
+        self._apply_input_enabled()
+
+    def set_grok_available(self, available: bool) -> None:
+        self._grok_available = available
+        self._refresh_grok_hint()
+        self._apply_input_enabled()
 
     def set_enabled(self, enabled: bool) -> None:
-        self.local_edit.setEnabled(enabled)
-        self.grok_edit.setEnabled(enabled)
-        self.local_button.setEnabled(enabled)
-        self.grok_button.setEnabled(enabled)
-        self.both_button.setEnabled(enabled)
+        self._inputs_enabled = enabled
+        self._apply_input_enabled()
+
+    def _refresh_grok_hint(self) -> None:
+        if not self._grok_available:
+            self.grok_hint.setText(self._grok_hint_nokey)
+            self.grok_hint.setVisible(True)
+            return
+        self.grok_hint.setText(self._grok_hint_ready)
+        self.grok_hint.setVisible(not self._monitor)
+
+    def _apply_input_enabled(self) -> None:
+        self.local_edit.setEnabled(self._inputs_enabled)
+        self.local_button.setEnabled(self._inputs_enabled)
+        grok_on = self._inputs_enabled and self._grok_available
+        self.grok_edit.setEnabled(grok_on)
+        self.grok_button.setEnabled(grok_on)
+        self.both_button.setEnabled(grok_on)
 
     def _send_local(self) -> None:
         text = self.local_edit.toPlainText()
