@@ -1,4 +1,4 @@
-from monitor_maid.instructions import parse_instructions, parse_relays, scrub_relay
+from monitor_maid.instructions import parse_instructions, parse_prompts, parse_relays, scrub_relay
 
 
 def test_explicit_fence_and_prefix():
@@ -50,6 +50,18 @@ def test_write_and_unknown_op():
     assert write[0].content == "hi"
     stop = parse_instructions('```maid-exec\n{"op":"stop_process","pid":42}\n```')
     assert stop[0].pid == 42
+
+
+def test_prompt_fence_is_closed_and_nonempty():
+    marked = parse_prompts(
+        "Here is the prompt.\n\n```prompt\nKeep going with manual approval.\n```\n"
+        "And another.\n\n```PROMPT\nSecond line.\n```"
+    )
+    assert marked == ["Keep going with manual approval.", "Second line."]
+    assert parse_prompts("An ordinary answer that mentions the word prompt.") == []
+    assert parse_prompts("```prompt\nnot closed") == []
+    assert parse_prompts("```prompt\n   \n```") == []
+    assert parse_prompts("") == []
 
 
 def test_relays_and_scrub():

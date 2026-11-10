@@ -4,12 +4,12 @@ from monitor_maid.context import (
     build_local_messages,
     compose_selection_prompt,
     format_transcript,
-    parse_conclusion_list,
-    seed_records,
+    normalise_prompt,
+    seed_draft,
     shutdown_plan,
     summary_messages,
 )
-from monitor_maid.models import NO_SUBSTANTIAL, Conclusion, HistoryItem, Summary, Turn, display_actor
+from monitor_maid.models import NO_SUBSTANTIAL, HistoryItem, Prompt, Summary, Turn, display_actor
 
 
 def _turn(**kwargs) -> Turn:
@@ -89,17 +89,21 @@ def test_transcript_truncates_oldest_turns():
     assert text.endswith("X" * 100) or "X" in text
 
 
-def test_shutdown_plan_and_conclusions():
+def test_shutdown_plan_and_prompts():
     assert shutdown_plan([]) == "skip"
     short = [_turn(content="hi")]
     assert shutdown_plan(short) == "note"
     long_user = _turn(content="Please explain how the session summary should be stored " * 3)
     reply = _turn(id="2", seq=2, actor="local_llm", content="It goes in the summaries table.")
     assert shutdown_plan([long_user, reply]) == "ask"
-    assert parse_conclusion_list('["Use manual approval."]') == ["Use manual approval."]
-    assert parse_conclusion_list("```json\n{\"conclusions\": [\"A\", \"B\"]}\n```") == ["A", "B"]
-    assert parse_conclusion_list("") == [NO_SUBSTANTIAL]
-    assert parse_conclusion_list("- first\n- second") == ["first", "second"]
+    assert normalise_prompt("  Keep the carried summary.  ") == "Keep the carried summary."
+    assert normalise_prompt("") == NO_SUBSTANTIAL
+    assert normalise_prompt(None) == NO_SUBSTANTIAL
+    assert display_actor("local_llm", "prompt", True) == "Prompt"
+    assert display_actor("grok", "prompt", False) == "Prompt"
+    assert display_actor("user", "message", True, {"seed": True, "source_kind": "conclusion"}) == (
+        "Carried prompt"
+    )
 
 
 def test_history_items_and_local_selection_hides_grok_label():
@@ -111,10 +115,11 @@ def test_history_items_and_local_selection_hides_grok_label():
     items = build_history_items(
         turns,
         [Summary(id="s", session_id="s", content="sum", created_at="2026-11-08T00:01:00+00:00")],
-        [Conclusion(id="c", session_id="s", content="done", created_at="2026-11-08T00:02:00+00:00")],
+        [Prompt(id="c", session_id="s", content="done", created_at="2026-11-08T00:02:00+00:00", author="grok")],
     )
     kinds = [item.kind for item in items]
-    assert kinds == ["question", "answer", "grok", "summary", "conclusion"]
+    assert kinds == ["question", "answer", "grok", "summary", "prompt"]
+    assert items[-1].actor == "grok"
     prompt = compose_selection_prompt(
         [HistoryItem("k", "grok", "grok", "t", "Grok: check the logs", "g")],
         "Look at this",
@@ -125,45 +130,33 @@ def test_history_items_and_local_selection_hides_grok_label():
     assert "check the logs" in prompt
 
 
-def test_seed_records_are_local_messages_and_hide_grok_attribution():
+def test_seed_draft_is_editable_text_and_hides_grok_attribution():
     items = [
         HistoryItem("q", "question", "user", "t1", "What is in the home directory?", "q"),
         HistoryItem("a", "answer", "local_llm", "t2", "A listing was produced.", "a"),
         HistoryItem("s", "summary", "local_llm", "t3", "The user listed the home directory.", "s"),
         HistoryItem("c", "conclusion", "local_llm", "t4", "The listing was approved.", "c"),
+        HistoryItem("p", "prompt", "grok", "t6", "Do the next step with manual approval.", "p"),
         HistoryItem("g", "grok", "grok", "t5", "Grok: look at the listing", "g"),
     ]
-    records = seed_records(items)
-    assert [actor for actor, _content, _meta in records] == ["user", "local_llm", "user", "user", "user"]
-    blob = "\n".join(content for _actor, content, _meta in records)
-    assert "What is in the home directory?" in blob
-    assert "Summary of an earlier session:" in blob
-    assert "Conclusion from an earlier session:" in blob
-    assert "Note:" in blob
-    assert "look at the listing" in blob
-    assert "Grok:" not in blob
-    assert all(meta.get("seed") for _actor, _content, meta in records)
-    turns = [
-        _turn(
-            id=str(index),
-            seq=index,
-            actor=actor,
-            kind="message",
-            content=content,
-            metadata=meta,
-        )
-        for index, (actor, content, meta) in enumerate(records, start=1)
-    ]
-    messages = build_local_messages(turns)
-    sent = "\n".join(message["content"] for message in messages)
-    assert "home directory" in sent
-    assert "Grok:" not in sent
+    draft = seed_draft(items)
+    assert draft.index("Question") < draft.index("Answer") < draft.index("Summary")
+    assert "What is in the home directory?" in draft
+    assert "A listing was produced." in draft
+    assert "The user listed the home directory." in draft
+    assert draft.count("Prompt\n") == 2
+    assert "Note\nlook at the listing" in draft
+    assert "Grok:" not in draft
+    assert seed_draft([HistoryItem("p", "prompt", "local_llm", "t", "Keep going.", "p")]) == (
+        "Keep going."
+    )
+    assert seed_draft(
+        [HistoryItem("a", "answer", "local_llm", "t2", "Only the reply.", "a")]
+    ) == "Only the reply."
+    assert seed_draft([HistoryItem("g", "grok", "grok", "t", "Grok: check the logs", "g")]) == (
+        "check the logs"
+    )
+    assert seed_draft([HistoryItem("g", "grok", "grok", "t", "   ", "g")]) == ""
     assert display_actor("user", "message", True, {"seed": True, "source_kind": "summary"}) == (
         "Carried summary"
     )
-    answer_only = seed_records(
-        [HistoryItem("a", "answer", "local_llm", "t2", "Only the reply.", "a")]
-    )
-    assert answer_only[0][0] == "user"
-    assert answer_only[0][1] == "Continue from the earlier replies below."
-    assert answer_only[1][0] == "local_llm"

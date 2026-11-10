@@ -4,15 +4,24 @@ shell=True is intentional: the documented convention is a shell command.
 Nothing reaches this module unless policy already allowed it, and catastrophic
 patterns are checked again here so a dialog edit cannot bypass them.
 stdin is DEVNULL. Interactive commands are rejected rather than hung.
+
+A Mac app opened from Finder does not receive the Terminal PATH. Host
+commands therefore take the environment of the user's login shell, which is
+what `ollama` and other Homebrew programs need.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("monitor_maid.executor")
+_ENV_MARKER = "___MONITOR_MAID_ENV___"
+_ENV_CACHE: dict[str, str] | None = None
 
 from monitor_maid.models import Instruction
 from monitor_maid.policy import (
@@ -80,6 +89,98 @@ def execute(
     return _refuse(f"Unsupported op {instruction.op!r}.")
 
 
+def command_environment() -> dict[str, str]:
+    """Environment for a host command, cached after the first lookup."""
+    global _ENV_CACHE
+    if _ENV_CACHE is None:
+        _ENV_CACHE = _build_command_environment()
+    return _ENV_CACHE
+
+
+def parse_env_block(raw: bytes) -> dict[str, str]:
+    """Parse `env -0` output that follows the marker, ignoring shell startup text."""
+    token = _ENV_MARKER.encode() + b"\0"
+    index = raw.find(token)
+    if index < 0:
+        return {}
+    parsed: dict[str, str] = {}
+    for item in raw[index + len(token) :].split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        try:
+            name = key.decode()
+            text = value.decode()
+        except UnicodeDecodeError:
+            continue
+        if name:
+            parsed[name] = text
+    return parsed
+
+
+def _login_shell_env() -> dict[str, str] | None:
+    """Read the environment a Terminal login would export.
+
+    `-l` reads the profile that adds Homebrew. `-i` reads the interactive
+    file that adds the rest of the user's PATH. Startup text stays before
+    the marker, so it is not treated as a variable.
+    """
+    shell = os.environ.get("SHELL", "").strip() or "/bin/zsh"
+    if not Path(shell).is_file():
+        shell = "/bin/zsh" if Path("/bin/zsh").is_file() else "/bin/sh"
+    script = f"printf '%s\\0' {_ENV_MARKER}; /usr/bin/env -0"
+    try:
+        proc = subprocess.run(
+            [shell, "-lic", script],
+            capture_output=True,
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parsed = parse_env_block(proc.stdout or b"")
+    if "PATH" not in parsed:
+        return None
+    return parsed
+
+
+def _with_user_bins(path: str, extras: list[Path] | None = None) -> str:
+    """Put the usual per-user bin directories on PATH when they exist."""
+    home = Path.home()
+    candidates = extras or [
+        home / ".grok" / "bin",
+        home / ".local" / "bin",
+        Path("/opt/homebrew/bin"),
+        Path("/opt/homebrew/sbin"),
+        Path("/usr/local/bin"),
+    ]
+    parts = [item for item in path.split(":") if item]
+    seen = set(parts)
+    prefix: list[str] = []
+    for extra in candidates:
+        text = str(extra)
+        if text in seen or not extra.is_dir():
+            continue
+        prefix.append(text)
+        seen.add(text)
+    return ":".join(prefix + parts)
+
+
+def _build_command_environment() -> dict[str, str]:
+    merged = os.environ.copy()
+    shell_env = _login_shell_env()
+    if shell_env:
+        merged.update(shell_env)
+        log.info("Host commands are using the login-shell environment.")
+    else:
+        log.info("The login shell did not report an environment. Host commands use the usual user bin directories.")
+    merged["PATH"] = _with_user_bins(merged.get("PATH", ""))
+    if not merged.get("HOME"):
+        merged["HOME"] = str(Path.home())
+    return merged
+
+
 def _resolve_cwd(cwd: str | None, default: str) -> str:
     if not cwd or cwd == ".":
         return default
@@ -102,6 +203,7 @@ def _run_shell(command: str, cwd: str, timeout: int, *, wait: bool) -> ExecResul
             command,
             shell=True,
             cwd=cwd,
+            env=command_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -147,6 +249,7 @@ def _start(command: str, cwd: str, log_dir: Path) -> ExecResult:
             command,
             shell=True,
             cwd=cwd,
+            env=command_environment(),
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,

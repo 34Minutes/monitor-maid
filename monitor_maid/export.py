@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 
-from monitor_maid.models import CommandRecord, Conclusion, Session, Summary, Turn, display_actor
+from monitor_maid.models import CommandRecord, Prompt, Session, Summary, Turn, display_actor
 
 
 def _actor_line(turn: Turn) -> str:
@@ -15,11 +15,15 @@ def _actor_line(turn: Turn) -> str:
     return f"{label}{note} — {turn.created_at}"
 
 
+def _prompt_author(prompt: Prompt) -> str:
+    return "Grok" if prompt.author == "grok" else "Local model"
+
+
 def session_to_markdown(
     session: Session,
     turns: list[Turn],
     summaries: list[Summary],
-    conclusions: list[Conclusion],
+    prompts: list[Prompt],
     commands: list[CommandRecord],
 ) -> str:
     lines = [
@@ -53,14 +57,16 @@ def session_to_markdown(
         lines.append("")
         lines.append(summary.content.rstrip())
         lines.append("")
-    lines.append("## Conclusions")
+    lines.append("## Prompts")
     lines.append("")
-    if not conclusions:
+    if not prompts:
         lines.append("_None._")
         lines.append("")
-    for conclusion in conclusions:
-        lines.append(f"- ({conclusion.created_at}) {conclusion.content}")
-    lines.append("")
+    for prompt in prompts:
+        lines.append(f"### {prompt.created_at} — {_prompt_author(prompt)}")
+        lines.append("")
+        lines.append(prompt.content.rstrip())
+        lines.append("")
     lines.append("## Commands")
     lines.append("")
     if not commands:
@@ -97,7 +103,7 @@ def session_to_plaintext(
     session: Session,
     turns: list[Turn],
     summaries: list[Summary],
-    conclusions: list[Conclusion],
+    prompts: list[Prompt],
     commands: list[CommandRecord],
 ) -> str:
     lines = [
@@ -124,13 +130,15 @@ def session_to_plaintext(
     if not summaries:
         lines.append("None.")
         lines.append("")
-    lines.append("CONCLUSIONS")
-    lines.append("-----------")
-    for conclusion in conclusions:
-        lines.append(f"- {conclusion.created_at}: {conclusion.content}")
-    if not conclusions:
+    lines.append("PROMPTS")
+    lines.append("-------")
+    for prompt in prompts:
+        lines.append(f"{prompt.created_at} ({_prompt_author(prompt)})")
+        lines.append(prompt.content.rstrip())
+        lines.append("")
+    if not prompts:
         lines.append("None.")
-    lines.append("")
+        lines.append("")
     lines.append("COMMANDS")
     lines.append("--------")
     for command in commands:
@@ -153,7 +161,7 @@ def session_to_html(
     session: Session,
     turns: list[Turn],
     summaries: list[Summary],
-    conclusions: list[Conclusion],
+    prompts: list[Prompt],
     commands: list[CommandRecord],
 ) -> str:
     parts = [
@@ -175,12 +183,14 @@ def session_to_html(
         parts.append(f"<pre>{html.escape(summary.content)}</pre>")
     if not summaries:
         parts.append("<p>None.</p>")
-    parts.append("<h2>Conclusions</h2><ul>")
-    for conclusion in conclusions:
-        parts.append(f"<li>{html.escape(conclusion.content)}</li>")
-    if not conclusions:
-        parts.append("<li>None.</li>")
-    parts.append("</ul><h2>Commands</h2>")
+    parts.append("<h2>Prompts</h2>")
+    for prompt in prompts:
+        title = f"{prompt.created_at} — {_prompt_author(prompt)}"
+        parts.append(f"<h3>{html.escape(title)}</h3>")
+        parts.append(f"<pre>{html.escape(prompt.content)}</pre>")
+    if not prompts:
+        parts.append("<p>None.</p>")
+    parts.append("<h2>Commands</h2>")
     for command in commands:
         title = f"{command.proposed_at} — {command.decision or command.status}"
         parts.append(f"<h3>{html.escape(title)}</h3>")

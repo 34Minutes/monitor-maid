@@ -45,3 +45,38 @@ def test_empty_session_shuts_down_cleanly(tmp_path, qapp):
     # A session with no turns is removed instead of storing an empty summary.
     assert db.list_sessions() == []
     db.close()
+
+
+def test_chat_is_on_the_left_and_history_and_input_are_on_the_right(tmp_path, qapp):
+    db = Database(tmp_path / "maid.db")
+    db.migrate()
+    window = MainWindow(db)
+    window.resize(1240, 800)
+    window.show()
+    qapp.processEvents()
+
+    def left_edge(widget) -> int:
+        return widget.mapTo(window, widget.rect().topLeft()).x()
+
+    def top_edge(widget) -> int:
+        return widget.mapTo(window, widget.rect().topLeft()).y()
+
+    assert left_edge(window.transcript) < left_edge(window.history)
+    assert abs(left_edge(window.composer) - left_edge(window.history)) < 40
+    assert top_edge(window.composer) > top_edge(window.history)
+    assert window.composer.width() < window.width() * 0.7
+    # The hidden Grok column must not reserve the space to the right of the input.
+    assert window.composer.local_edit.width() > window.composer.width() * 0.6
+    window.monitor_button.setChecked(True)
+    qapp.processEvents()
+    assert window.composer.grok_edit.isVisible()
+    total = max(window.composer.input_split.width(), 2)
+    window.composer.input_split.setSizes([int(total * 0.75), int(total * 0.25)])
+    qapp.processEvents()
+    assert window.composer.local_edit.width() > window.composer.grok_edit.width()
+    window.close()
+    for _ in range(30):
+        qapp.processEvents()
+        if window._quit_done and not window.isVisible():
+            break
+    db.close()

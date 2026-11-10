@@ -19,6 +19,7 @@ from monitor_maid.models import Turn, display_actor
 
 _SPECIAL = {
     "summary",
+    "prompt",
     "conclusion",
     "command_result",
     "error",
@@ -34,8 +35,8 @@ def _role(turn: Turn) -> str:
         source = str(turn.metadata.get("source_kind") or "")
         if source in {"summary", "grok", "preamble"}:
             return "summary"
-        if source == "conclusion":
-            return "conclusion"
+        if source in {"prompt", "conclusion"}:
+            return "prompt"
     if turn.kind in _SPECIAL:
         return turn.kind
     return turn.actor

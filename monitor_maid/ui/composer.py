@@ -5,12 +5,22 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
+    QWidget,
+)
+
+_HINT_ENTER_SENDS = (
+    "Enter sends. ⌘/Ctrl+Enter adds a line. ⌘/Ctrl+Shift+Enter sends both."
+)
+_HINT_CHORD_SENDS = (
+    "⌘/Ctrl+Enter sends. Enter adds a line. ⌘/Ctrl+Shift+Enter sends both."
 )
 
 
@@ -18,15 +28,27 @@ class _Edit(QPlainTextEdit):
     send = pyqtSignal()
     send_both = pyqtSignal()
 
+    def __init__(self):
+        super().__init__()
+        self.enter_submits = True
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         enter = event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
         mods = event.modifiers()
-        if enter and mods & Qt.KeyboardModifier.ShiftModifier and mods & (
-            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
-        ):
+        ctrl = bool(
+            mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+        )
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if enter and ctrl and shift:
             self.send_both.emit()
             return
-        if enter and mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+        if enter and ctrl:
+            if self.enter_submits:
+                self.insertPlainText("\n")
+            else:
+                self.send.emit()
+            return
+        if enter and self.enter_submits and not shift:
             self.send.emit()
             return
         super().keyPressEvent(event)
@@ -36,6 +58,7 @@ class Composer(QFrame):
     send_local = pyqtSignal(str)
     send_grok = pyqtSignal(str)
     send_both = pyqtSignal(str, str)
+    enter_mode_changed = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -43,41 +66,55 @@ class Composer(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
-        panes = QHBoxLayout()
         self.local_edit = _Edit()
         self.local_edit.setObjectName("localInput")
-        self.local_edit.setPlaceholderText(
-            "Message the local model. It cannot see Grok.  ⌘/Ctrl+Enter to send."
-        )
         self.local_edit.setMinimumHeight(90)
         self.grok_edit = _Edit()
         self.grok_edit.setObjectName("grokInput")
-        self.grok_edit.setPlaceholderText(
-            "Your own question to Grok. It is not added to the local model's task. "
-            "Grok can still see the local transcript.  ⌘/Ctrl+Enter to send."
-        )
         self.grok_edit.setMinimumHeight(90)
-        local_col = QVBoxLayout()
+        self.enter_sends = QCheckBox("Enter sends")
+        self.enter_sends.setObjectName("enterSends")
+        self.enter_sends.setChecked(True)
+        self.enter_sends.setToolTip(
+            "When on, Enter submits and ⌘/Ctrl+Enter starts a new line. "
+            "When off, ⌘/Ctrl+Enter submits and Enter starts a new line."
+        )
+        local_wrap = QWidget()
+        local_col = QVBoxLayout(local_wrap)
+        local_col.setContentsMargins(0, 0, 0, 0)
         local_label = QLabel("Local model")
         local_label.setObjectName("dotLocal")
         local_col.addWidget(local_label)
-        local_col.addWidget(self.local_edit)
-        grok_col = QVBoxLayout()
+        local_row = QHBoxLayout()
+        local_row.setContentsMargins(0, 0, 0, 0)
+        local_row.addWidget(self.local_edit, 1)
+        local_row.addWidget(self.enter_sends, 0, Qt.AlignmentFlag.AlignVCenter)
+        local_col.addLayout(local_row)
+        self._grok_column = QWidget()
+        self._grok_column.setObjectName("grokColumn")
+        grok_col = QVBoxLayout(self._grok_column)
+        grok_col.setContentsMargins(0, 0, 0, 0)
         self.grok_label = QLabel("Grok")
         self.grok_label.setObjectName("dotGrok")
         grok_col.addWidget(self.grok_label)
         grok_col.addWidget(self.grok_edit)
-        self._grok_col_widgets = (self.grok_label, self.grok_edit)
-        panes.addLayout(local_col, 1)
-        panes.addLayout(grok_col, 1)
-        root.addLayout(panes)
+        self.input_split = QSplitter(Qt.Orientation.Horizontal)
+        self.input_split.setObjectName("inputSplit")
+        self.input_split.setChildrenCollapsible(False)
+        self.input_split.setHandleWidth(8)
+        self.input_split.addWidget(local_wrap)
+        self.input_split.setStretchFactor(0, 1)
+        self._grok_column.setParent(self)
+        self._grok_column.hide()
+        self.grok_edit.hide()
+        root.addWidget(self.input_split)
 
         buttons = QHBoxLayout()
         self.local_button = QPushButton("Send to local")
         self.local_button.setObjectName("primary")
         self.grok_button = QPushButton("Send to Grok")
         self.both_button = QPushButton("Send to both")
-        self.hint = QLabel("⌘/Ctrl+Enter sends the focused pane. ⌘/Ctrl+Shift+Enter sends both.")
+        self.hint = QLabel(_HINT_ENTER_SENDS)
         self.hint.setObjectName("muted")
         self._grok_hint_ready = (
             "To ask Grok something of your own, turn on Monitor mode and type in the Grok box. "
@@ -107,21 +144,51 @@ class Composer(QFrame):
         self.grok_edit.send.connect(self._send_grok)
         self.local_edit.send_both.connect(self._send_both)
         self.grok_edit.send_both.connect(self._send_both)
+        self.enter_sends.toggled.connect(self._on_enter_toggled)
         self._monitor = False
         self._grok_available = True
         self._inputs_enabled = True
+        self._apply_enter_mode(True)
         self.set_monitor(False)
+
+    def set_enter_submits(self, enabled: bool) -> None:
+        """Choose Enter-to-send without treating it as a user toggle."""
+        self.enter_sends.blockSignals(True)
+        self.enter_sends.setChecked(enabled)
+        self.enter_sends.blockSignals(False)
+        self._apply_enter_mode(enabled)
 
     def set_monitor(self, enabled: bool) -> None:
         self._monitor = enabled
-        for widget in self._grok_col_widgets:
-            widget.setVisible(enabled)
         self.grok_button.setVisible(enabled)
         self.both_button.setVisible(enabled)
-        self.hint.setVisible(enabled)
         self.local_button.setText("Send to local" if enabled else "Send")
+        self._place_grok_column(enabled)
         self._refresh_grok_hint()
         self._apply_input_enabled()
+
+    def _place_grok_column(self, enabled: bool) -> None:
+        """Keep the local box full width until Monitor mode shows Grok.
+
+        A hidden column left in the row still takes half the width. Monitor
+        mode puts Grok back, with a handle so either box can be dragged wider.
+        """
+        in_split = self.input_split.indexOf(self._grok_column) >= 0
+        if enabled:
+            if not in_split:
+                self.input_split.addWidget(self._grok_column)
+                self.input_split.setStretchFactor(1, 1)
+            self._grok_column.setVisible(True)
+            self.grok_edit.setVisible(True)
+            self.grok_label.setVisible(True)
+            width = max(self.input_split.width(), 2)
+            self.input_split.setSizes([width // 2, width // 2])
+        else:
+            self.grok_edit.hide()
+            self.grok_label.hide()
+            self._grok_column.hide()
+            if in_split:
+                self._grok_column.setParent(self)
 
     def set_grok_available(self, available: bool) -> None:
         self._grok_available = available
@@ -131,6 +198,36 @@ class Composer(QFrame):
     def set_enabled(self, enabled: bool) -> None:
         self._inputs_enabled = enabled
         self._apply_input_enabled()
+
+    def _on_enter_toggled(self, checked: bool) -> None:
+        self._apply_enter_mode(checked)
+        self.enter_mode_changed.emit(checked)
+
+    def _apply_enter_mode(self, enter_submits: bool) -> None:
+        self.local_edit.enter_submits = enter_submits
+        self.grok_edit.enter_submits = enter_submits
+        if enter_submits:
+            self.local_edit.setPlaceholderText(
+                "Message the local model. It cannot see Grok.  "
+                "Enter to send, ⌘/Ctrl+Enter for a new line."
+            )
+            self.grok_edit.setPlaceholderText(
+                "Your own question to Grok. It is not added to the local model's task. "
+                "Grok can still see the local transcript.  "
+                "Enter to send, ⌘/Ctrl+Enter for a new line."
+            )
+            self.hint.setText(_HINT_ENTER_SENDS)
+        else:
+            self.local_edit.setPlaceholderText(
+                "Message the local model. It cannot see Grok.  "
+                "⌘/Ctrl+Enter to send, Enter for a new line."
+            )
+            self.grok_edit.setPlaceholderText(
+                "Your own question to Grok. It is not added to the local model's task. "
+                "Grok can still see the local transcript.  "
+                "⌘/Ctrl+Enter to send, Enter for a new line."
+            )
+            self.hint.setText(_HINT_CHORD_SENDS)
 
     def _refresh_grok_hint(self) -> None:
         if not self._grok_available:
@@ -143,6 +240,7 @@ class Composer(QFrame):
     def _apply_input_enabled(self) -> None:
         self.local_edit.setEnabled(self._inputs_enabled)
         self.local_button.setEnabled(self._inputs_enabled)
+        self.enter_sends.setEnabled(self._inputs_enabled)
         grok_on = self._inputs_enabled and self._grok_available
         self.grok_edit.setEnabled(grok_on)
         self.grok_button.setEnabled(grok_on)

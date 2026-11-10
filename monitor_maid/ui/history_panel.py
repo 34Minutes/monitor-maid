@@ -1,4 +1,4 @@
-"""Checkbox history browser for questions, answers, summaries, and conclusions."""
+"""Checkbox history browser for questions, answers, summaries, and prompts."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ _FILTERS = (
     ("question", "Questions"),
     ("answer", "Answers"),
     ("summary", "Summaries"),
-    ("conclusion", "Conclusions"),
+    ("prompt", "Prompts"),
     ("grok", "Grok"),
 )
 
@@ -114,21 +114,21 @@ class HistoryPanel(QWidget):
         start.triggered.connect(lambda _checked=False: self.new_from_checked.emit())
         menu.addSeparator()
         view_summary = menu.addAction("View summary")
-        view_conclusion = menu.addAction("View conclusion")
+        view_prompt = menu.addAction("View prompt")
         summary_row = item is not None and item.kind == "summary"
-        conclusion_row = item is not None and item.kind == "conclusion"
+        prompt_row = item is not None and item.kind == "prompt"
         view_summary.setEnabled(summary_row)
-        view_conclusion.setEnabled(conclusion_row)
+        view_prompt.setEnabled(prompt_row)
         view_summary.setToolTip(
             "Open this summary." if summary_row else "Right-click a summary row."
         )
-        view_conclusion.setToolTip(
-            "Open this conclusion." if conclusion_row else "Right-click a conclusion row."
+        view_prompt.setToolTip(
+            "Open this prompt." if prompt_row else "Right-click a prompt row."
         )
         if summary_row:
             view_summary.triggered.connect(lambda _checked=False: self.view_item.emit(item))
-        if conclusion_row:
-            view_conclusion.triggered.connect(lambda _checked=False: self.view_item.emit(item))
+        if prompt_row:
+            view_prompt.triggered.connect(lambda _checked=False: self.view_item.emit(item))
         return menu
 
     def checked_items(self) -> list[HistoryItem]:

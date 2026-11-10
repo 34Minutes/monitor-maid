@@ -27,8 +27,8 @@ def display_actor(
         source = str(metadata.get("source_kind") or "")
         if source == "summary":
             return "Carried summary"
-        if source == "conclusion":
-            return "Carried conclusion"
+        if source in {"prompt", "conclusion"}:
+            return "Carried prompt"
         if source == "grok":
             return "Carried note"
         if source == "answer" or actor == "local_llm":
@@ -38,8 +38,8 @@ def display_actor(
         return "Carried in"
     if kind == "summary":
         return "Summary"
-    if kind == "conclusion":
-        return "Conclusions"
+    if kind in {"prompt", "conclusion"}:
+        return "Prompt"
     if kind == "command_result":
         return "Host"
     if kind in {"review", "verification", "refusal"} or actor == "grok":
@@ -97,11 +97,12 @@ class Summary:
 
 
 @dataclass
-class Conclusion:
+class Prompt:
     id: str
     session_id: str
     content: str
     created_at: str
+    author: str = "local_llm"
 
 
 @dataclass
@@ -138,7 +139,7 @@ class ProcessRecord:
 @dataclass
 class HistoryItem:
     key: str
-    kind: str  # question, answer, summary, conclusion, grok
+    kind: str  # question, answer, summary, prompt, grok
     actor: str
     created_at: str
     content: str

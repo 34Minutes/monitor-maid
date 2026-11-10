@@ -42,6 +42,7 @@ _BASH_FENCE = re.compile(
 )
 _RELAY = re.compile(r"```maid-to-local[^\n]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _RELAY_PARTIAL = re.compile(r"```maid-to-local[^\n]*\n(.*)\Z", re.IGNORECASE | re.DOTALL)
+_PROMPT_FENCE = re.compile(r"```prompt[^\n]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
 _OPS = {"shell", "write_file", "read_file", "start_process", "stop_process"}
 
@@ -202,3 +203,15 @@ def parse_relays(text: str) -> list[RelayBlock]:
     if partial and partial.group(1).strip():
         blocks.append(RelayBlock(text=partial.group(1).strip(), partial=True))
     return [block for block in blocks if block.text]
+
+
+def parse_prompts(text: str) -> list[str]:
+    """Return the text of closed ```prompt fences. An open fence is not a prompt."""
+    if not text:
+        return []
+    found = []
+    for match in _PROMPT_FENCE.finditer(text):
+        body = match.group(1).strip()
+        if body:
+            found.append(body)
+    return found

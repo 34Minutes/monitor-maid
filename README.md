@@ -59,11 +59,17 @@ Set `MONITOR_MAID_DATA_DIR` to use a different folder.
 
 Each session has a UUID. Turns are stored with an actor: `user`, `local_llm`, `grok`, or `system` (host results and notices).
 
+**Model**, to the left of **Session**, lists the models Ollama has installed (`ollama list`). Choosing one unloads any other model Ollama has loaded and loads the one you picked. That choice is saved on the open session and becomes the default for a later new session. The first time the window opens, the list is filled but a model is not loaded until you pick a different one or send a message.
+
 **Rename**, next to the session list, or **Rename session…** in the Session menu, sets a name you choose. That name stays. Until you rename it, a new session takes its name from the first message.
 
-A new session started from a summary, a conclusion, or ticked history rows shows that text in the chat immediately. The local model is not called yet. Send your next question in the normal box. That question goes out with the carried text already in front of it. You do not paste the summary in again.
+A new session started from a summary, a prompt, a question, an answer, or ticked history rows asks which model to use, then puts that text in the input box. The chat stays empty. Edit the text if you want, then press Enter to send it. If you picked a different model, the one that was loaded is stopped and the new one is started.
 
-**End session** asks with **Cancel**, **Yes**, and **No**. **Cancel** leaves the session open. **Yes** asks the local model for a short summary and for the conclusions that were actually reached, then stores them. A session with no turns is discarded. A very short one stores “No substantial discussion.” and does not call the model. Each call has a timeout (Settings, default 90s). If Ollama is down, the session still closes and the summary says why. **No** closes the session and does not store a summary or conclusions. Notes already stored stay as they are.
+**Enter** sends the message in the focused box. **⌘/Ctrl+Enter** adds a line. **⌘/Ctrl+Shift+Enter** sends both when Monitor mode is on. **Enter sends**, beside the local box, reverses that for both boxes: ⌘/Ctrl+Enter sends and Enter adds a line. The choice is saved.
+
+The chat is on the left. History, Commands, and the input box are on the right, with the input under the tabs. The local box uses the full width of that column. Drag the divider between the two columns to resize them. With Monitor mode on, drag the handle between the local box and the Grok box.
+
+**End session** asks with **Cancel**, **Yes**, and **No**. **Cancel** leaves the session open. **Yes** asks the local model for a short summary and stores it. A session with no turns is discarded. A very short one stores “No substantial discussion.” and does not call the model. Each call has a timeout (Settings, default 90s). If Ollama is down, the session still closes and the summary says why. **No** closes the session and does not store a summary. Notes already stored stay as they are.
 
 Quitting the app runs that same shutdown for the session you have open. The summary dialog has **Skip summary** if you need to leave immediately.
 
@@ -71,9 +77,15 @@ If the process is killed, the next launch notices the unclean exit and offers to
 
 Closed sessions stay in the session list. **Reopen** continues one. Previous summaries are kept.
 
-The **Session** menu can store a summary or conclusions without ending the session. **Browse sessions…** lists every session and the notes stored on it. **Delete session** there removes that session’s transcript, summaries, and conclusions after a confirmation. If a reply is still running, the open session cannot be deleted until it finishes. **View summary** opens the latest summary. **View conclusion** opens every conclusion stored on the session you have open. The History right-click menu opens the summary or conclusion on that row. The note window has a button that starts a new session containing only that text.
+A prompt is stored only when the local model or Grok marks one in its reply:
 
-**New session from checked items** (Session menu, or right-click a history row) reads the ticked rows from the database and starts a session that contains only those rows. A kind filter does not drop a tick. The local model then sees that shorter record. Grok rows are carried as notes, with a leading “Grok:” removed.
+```prompt
+the prompt text
+```
+
+Ask either model to write a prompt. The app keeps the text inside that fence and marks the reply as a prompt. An ordinary answer is not stored as a prompt. **Create prompt** and **Create prompt with Grok** in the Session menu ask for one; Grok needs an API key. A Grok prompt stays off the local model's record until you carry it into a new session. **Browse sessions…** lists every session and the notes stored on it. **Delete session** there removes that session’s transcript, summaries, and prompts after a confirmation. If a reply is still running, the open session cannot be deleted until it finishes. **View summary** opens the latest summary. **View prompt** opens the prompts stored on the session you have open. The History right-click menu opens the summary or prompt on that row. The note window has a button that starts a new session containing only that text.
+
+**New session from checked items** (Session menu, or right-click a history row) reads the ticked rows from the database and places them in the input box of a new session. A kind filter does not drop a tick. Several rows stay in order, each with a label. A Grok row has a leading “Grok:” removed. Nothing is sent until you press Enter.
 
 ## Three execution modes
 
@@ -128,6 +140,8 @@ A generic bash fence is treated as a guess and always asks you. An opened fence 
 
 `shell` uses the system shell. That is the documented interface, and it is why manual approval is the default. Do not turn on fully automatic mode for a model you do not trust.
 
+Host commands run as the user who opened the app. They receive that user's login-shell environment, including the `PATH` a Terminal window would have, so a Homebrew program such as `ollama` can be found when the app was opened from Finder. The command itself is still run by `/bin/sh`, so a zsh alias is not a command. macOS privacy access (Desktop, Documents, Downloads) is granted to each app separately; the system asks the first time a command needs one of those folders.
+
 ## Monitor mode and Grok
 
 **Monitor mode** shows a second input. Type your own question there when you want Grok's view without adding that question to the local model's task. You can send to the local model, to Grok, or to both. Checking rows and using **Ask Grok** is a different path: it sends only the items you marked, plus a question about those items.
@@ -152,14 +166,14 @@ Command review, when you press **Ask Grok to review** (or enable it for automati
 
 ## History selection
 
-The History tab lists questions, answers, summaries, conclusions, and Grok notes, with a checkbox on each row. Filter by kind, then:
+The History tab lists questions, answers, summaries, prompts, and Grok notes, with a checkbox on each row. Filter by kind, then:
 
 - **Ask Grok** sends the selection plus your question. The local model does not see that exchange.
 - **Send to local** sends the selection as a user message. Grok notes are relabeled and are not introduced as Grok.
-- **Verify with Grok** asks Grok whether the selected answers, summaries, and conclusions are supported by the transcript.
-- Right-click a row to view that summary or conclusion, or to start a new session from the ticked rows.
+- **Verify with Grok** asks Grok whether the selected answers, summaries, and prompts are supported by the transcript.
+- Right-click a row to view that summary or prompt, or to start a new session from the ticked rows.
 
-**Export** writes Markdown or plain text with the actor, timestamp, and content, including summaries, conclusions, and the command log. If rows are checked, you can export just those. **Print** sends the same transcript to the printer.
+**Export** writes Markdown or plain text with the actor, timestamp, and content, including summaries, prompts, and the command log. If rows are checked, you can export just those. **Print** sends the same transcript to the printer.
 
 ## Settings
 

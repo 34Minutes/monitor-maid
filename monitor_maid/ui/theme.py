@@ -88,6 +88,8 @@ QTabBar::tab:selected { background: #2c241c; color: #f0d3a8; }
 QScrollBar:vertical { background: #14171d; width: 10px; }
 QScrollBar::handle:vertical { background: #3a4150; border-radius: 4px; }
 QStatusBar { background: #101318; color: #9aa3b2; }
+QSplitter::handle { background: #2e3440; }
+QSplitter::handle:hover { background: #c9843e; }
 QMenuBar { background: #1b1f27; color: #e7e9ee; }
 QMenuBar::item:selected { background: #2c241c; }
 QMenu {
@@ -116,7 +118,7 @@ QFrame#bubble[role="local_llm"] { background: #182820; border-left-color: #8fceb
 QFrame#bubble[role="grok"] { background: #2a2233; border-left-color: #d7a6f5; }
 QFrame#bubble[role="relay"] { background: #1c2838; border-left-color: #6f93cc; }
 QFrame#bubble[role="summary"] { background: #2c2618; border-left-color: #e0b15a; }
-QFrame#bubble[role="conclusion"] { background: #2c2218; border-left-color: #e09a62; }
+QFrame#bubble[role="prompt"], QFrame#bubble[role="conclusion"] { background: #2c2218; border-left-color: #e09a62; }
 QFrame#bubble[role="command_result"] { background: #241c1c; border-left-color: #e07a72; }
 QFrame#bubble[role="error"] { background: #301c1c; border-left-color: #f07178; }
 QFrame#bubble[role="review"], QFrame#bubble[role="verification"] {

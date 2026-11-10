@@ -16,10 +16,10 @@ from monitor_maid.context import build_history_items, build_local_messages
 from monitor_maid.db import Database
 from monitor_maid.models import NO_SUBSTANTIAL, HistoryItem, LLMReply
 from monitor_maid.ollama_client import OllamaClient
-from monitor_maid.prompts import CONCLUSION_INSTRUCTION, SUMMARY_INSTRUCTION
-from monitor_maid.ui.dialogs import EndSessionDialog, NoteDialog, NotesBrowser
+from monitor_maid.prompts import PROMPT_INSTRUCTION, SUMMARY_INSTRUCTION
+from monitor_maid.xai_client import XAIClient
+from monitor_maid.ui.dialogs import EndSessionDialog, NoteDialog, NotesBrowser, SeedModelDialog
 from monitor_maid.ui.main_window import MainWindow
-from monitor_maid.ui.transcript import Bubble
 
 
 @pytest.fixture(scope="module")
@@ -140,8 +140,8 @@ def test_end_no_closes_without_storing_a_summary(tmp_path, qapp):
     _wait_idle(window, qapp)
     assert db.get_session(sid).status == "closed"
     assert [item.content for item in db.list_summaries(sid)] == ["Already stored"]
-    assert db.list_conclusions(sid) == []
-    assert not any(turn.kind in {"summary", "conclusion"} for turn in db.list_turns(sid))
+    assert db.list_prompts(sid) == []
+    assert not any(turn.kind in {"summary", "prompt"} for turn in db.list_turns(sid))
     assert not window.progress.isVisible()
     _close(window, db, qapp)
     db.close()
@@ -157,11 +157,12 @@ def test_session_menu_stores_a_short_note_without_closing(tmp_path, qapp):
         "Rename session…",
         "",
         "Create summary",
-        "Create conclusions",
+        "Create prompt",
+        "Create prompt with Grok",
         "",
         "Browse sessions…",
         "View summary",
-        "View conclusion",
+        "View prompt",
         "",
         "New session from checked items",
     ]
@@ -195,10 +196,10 @@ def test_session_menu_stores_a_short_note_without_closing(tmp_path, qapp):
     labels = [action.text() for action in menu.actions()]
     assert "New session from checked items" in labels
     assert "View summary" in labels
-    assert "View conclusion" in labels
+    assert "View prompt" in labels
     by_text = {action.text(): action for action in menu.actions()}
     assert by_text["View summary"].isEnabled()
-    assert not by_text["View conclusion"].isEnabled()
+    assert not by_text["View prompt"].isEnabled()
     assert by_text["New session from checked items"].isEnabled()
     window.history._boxes["summary"].setChecked(False)
     assert all(item.kind != "summary" for item in window.history.selected_items())
@@ -212,7 +213,7 @@ def test_session_menu_stores_a_short_note_without_closing(tmp_path, qapp):
     )
     question_actions = {action.text(): action for action in question_menu.actions()}
     assert not question_actions["View summary"].isEnabled()
-    assert not question_actions["View conclusion"].isEnabled()
+    assert not question_actions["View prompt"].isEnabled()
 
     browser = NotesBrowser(db, window, current_id=sid)
     assert browser.sessions.count() == 1
@@ -241,8 +242,8 @@ def test_model_notes_seed_a_new_session_from_the_database(tmp_path, qapp, monkey
     def fake_chat(self, model, messages, timeout):
         last = messages[-1]["content"]
         calls.append(last)
-        if "JSON array" in last:
-            return LLMReply(text='["Keep the carried summary."]')
+        if "standalone prompt" in last:
+            return LLMReply(text="```prompt\nKeep the carried summary.\n```")
         return LLMReply(text="They discussed storing a session summary.")
 
     monkeypatch.setattr(OllamaClient, "chat", fake_chat)
@@ -278,20 +279,30 @@ def test_model_notes_seed_a_new_session_from_the_database(tmp_path, qapp, monkey
         message["content"] for message in stored
     )
 
-    window.act_create_conclusions.trigger()
+    window.act_create_prompt.trigger()
     _wait_idle(window, qapp)
     assert db.get_session(sid).status == "open"
-    assert [item.content for item in db.list_conclusions(sid)] == ["Keep the carried summary."]
-    assert CONCLUSION_INSTRUCTION not in "\n".join(turn.content for turn in db.list_turns(sid))
-    assert any("JSON array" in text for text in calls)
+    stored_prompts = db.list_prompts(sid)
+    assert [item.content for item in stored_prompts] == ["Keep the carried summary."]
+    assert stored_prompts[0].author == "local_llm"
+    prompt_turns = [turn for turn in db.list_turns(sid) if turn.kind == "prompt"]
+    assert len(prompt_turns) == 1
+    assert prompt_turns[0].actor == "local_llm"
+    assert prompt_turns[0].content == "```prompt\nKeep the carried summary.\n```"
+    assert PROMPT_INSTRUCTION not in "\n".join(turn.content for turn in db.list_turns(sid))
+    assert any("standalone prompt" in text for text in calls)
+    local_after = build_local_messages(db.list_turns(sid))
+    assert "Keep the carried summary." in "\n".join(
+        message["content"] for message in local_after
+    )
 
     items = build_history_items(
         db.list_turns(sid),
         db.list_summaries(sid),
-        db.list_conclusions(sid),
+        db.list_prompts(sid),
     )
     summary = next(item for item in items if item.kind == "summary")
-    conclusion = next(item for item in items if item.kind == "conclusion")
+    prompt = next(item for item in items if item.kind == "prompt")
     grok = next(item for item in items if item.kind == "grok")
     stale = HistoryItem(
         summary.key,
@@ -305,28 +316,133 @@ def test_model_notes_seed_a_new_session_from_the_database(tmp_path, qapp, monkey
     qapp.processEvents()
     fresh = window.orchestrator.session_id
     assert fresh != sid
-    window._start_from_items([stale, conclusion, grok])
+
+    def accept_seed_model():
+        for widget in qapp.topLevelWidgets():
+            if isinstance(widget, SeedModelDialog) and widget.isVisible():
+                widget.start_button.click()
+                return
+        raise AssertionError("model dialog did not open")
+
+    QTimer.singleShot(0, accept_seed_model)
+    window._start_from_items([stale, prompt, grok])
     qapp.processEvents()
     assert window.orchestrator.session_id == fresh
-    seeded = db.list_turns(fresh)
-    blob = "\n".join(turn.content for turn in seeded)
-    assert "STALE COPY" not in blob
-    assert "They discussed storing a session summary." in blob
-    assert "Keep the carried summary." in blob
-    assert "hidden remark" in blob
-    assert "Grok:" not in blob
-    assert all(turn.kind == "message" and turn.visible_to_local for turn in seeded)
-    assert all(turn.actor != "grok" for turn in seeded)
-    seen = build_local_messages(seeded)
-    seen_blob = "\n".join(message["content"] for message in seen)
-    assert "hidden remark" in seen_blob
-    assert "Grok:" not in seen_blob
-    bubbles = window.transcript.findChildren(Bubble)
-    assert any("Carried summary" in bubble.meta.text() for bubble in bubbles)
-    assert any("Carried conclusion" in bubble.meta.text() for bubble in bubbles)
-    assert any("Carried note" in bubble.meta.text() for bubble in bubbles)
+    assert db.list_turns(fresh) == []
+    draft = window.composer.local_edit.toPlainText()
+    assert "STALE COPY" not in draft
+    assert "They discussed storing a session summary." in draft
+    assert "Keep the carried summary." in draft
+    assert "hidden remark" in draft
+    assert "Grok:" not in draft
+    assert "Summary\n" in draft
+    assert "Prompt\n" in draft
+    assert "Note\n" in draft
+    assert "in the input box" in window.status_label.text()
     assert db.get_session(sid).status == "open"
 
     _close(window, db, qapp)
     assert window._quit_done
+    db.close()
+
+
+def test_a_chat_reply_stores_a_prompt_only_when_marked(tmp_path, qapp, monkeypatch):
+    def fake_chat(self, model, messages, timeout):
+        last = messages[-1]["content"]
+        if "mark this one" in last:
+            return LLMReply(text="```prompt\nKeep going with manual approval.\n```")
+        return LLMReply(text="An ordinary answer that mentions the word prompt.\n```prompt\nnot closed")
+
+    monkeypatch.setattr(OllamaClient, "chat", fake_chat)
+    db = Database(tmp_path / "maid.db")
+    db.migrate()
+    window = MainWindow(db)
+    window.show()
+    qapp.processEvents()
+    sid = window.orchestrator.session_id
+    assert window.orchestrator.submit_local("Say something about a prompt.")
+    _wait_idle(window, qapp)
+    assert db.list_prompts(sid) == []
+    assert not any(turn.kind == "prompt" for turn in db.list_turns(sid))
+
+    assert window.orchestrator.submit_local("Please mark this one.")
+    _wait_idle(window, qapp)
+    prompts = db.list_prompts(sid)
+    assert [item.content for item in prompts] == ["Keep going with manual approval."]
+    assert prompts[0].author == "local_llm"
+    marked = [turn for turn in db.list_turns(sid) if turn.kind == "prompt"]
+    assert len(marked) == 1
+    assert marked[0].content == "```prompt\nKeep going with manual approval.\n```"
+    local = "\n".join(
+        message["content"] for message in build_local_messages(db.list_turns(sid))
+    )
+    assert "Keep going with manual approval." in local
+    assert "An ordinary answer" in local
+    assert "Prompt stored." in window.status_label.text()
+
+    _close(window, db, qapp)
+    db.close()
+
+
+def test_grok_prompt_is_stored_and_a_refusal_is_not(tmp_path, qapp, monkeypatch):
+    replies = [
+        LLMReply(text="```prompt\nContinue the listing work with manual approval.\n```"),
+        LLMReply(text="An ordinary answer with no fence."),
+        LLMReply(text="No.", refused=True),
+    ]
+
+    def fake_complete(self, model, messages, timeout):
+        assert any("standalone prompt" in message["content"] for message in messages)
+        return replies.pop(0)
+
+    monkeypatch.setattr(XAIClient, "complete", fake_complete)
+    monkeypatch.setattr(
+        "monitor_maid.orchestrator.effective_api_key",
+        lambda _settings: "test-key",
+    )
+    db = Database(tmp_path / "maid.db")
+    db.migrate()
+    window = MainWindow(db)
+    window.show()
+    qapp.processEvents()
+    sid = window.orchestrator.session_id
+    db.add_turn(
+        sid,
+        actor="user",
+        kind="message",
+        content="Please explain how a stored prompt should be written " * 3,
+    )
+    qapp.processEvents()
+    assert window.orchestrator.request_prompt("grok")
+    _wait_idle(window, qapp)
+    prompts = db.list_prompts(sid)
+    assert [item.content for item in prompts] == [
+        "Continue the listing work with manual approval."
+    ]
+    assert prompts[0].author == "grok"
+    prompt_turns = [turn for turn in db.list_turns(sid) if turn.kind == "prompt"]
+    assert len(prompt_turns) == 1
+    assert prompt_turns[0].actor == "grok"
+    assert prompt_turns[0].visible_to_local is False
+    assert prompt_turns[0].content.startswith("```prompt")
+    hidden = build_local_messages(db.list_turns(sid))
+    assert "Continue the listing work" not in "\n".join(
+        message["content"] for message in hidden
+    )
+
+    assert window.orchestrator.request_prompt("grok")
+    _wait_idle(window, qapp)
+    assert len(db.list_prompts(sid)) == 1
+    assert "No prompt was stored" in window.status_label.text()
+    assert any(
+        turn.actor == "grok" and turn.kind == "message" and "ordinary answer" in turn.content
+        for turn in db.list_turns(sid)
+    )
+
+    assert window.orchestrator.request_prompt("grok")
+    _wait_idle(window, qapp)
+    assert len(db.list_prompts(sid)) == 1
+    assert "Nothing was stored" in window.status_label.text()
+
+    _close(window, db, qapp)
     db.close()

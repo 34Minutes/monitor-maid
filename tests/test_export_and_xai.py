@@ -1,5 +1,5 @@
 from monitor_maid.export import session_to_markdown, session_to_plaintext
-from monitor_maid.models import CommandRecord, Conclusion, Session, Summary, Turn
+from monitor_maid.models import CommandRecord, Prompt, Session, Summary, Turn
 from monitor_maid.xai_client import extract_output_text
 
 
@@ -46,7 +46,15 @@ def test_export_includes_actor_timestamp_and_content():
         ),
     ]
     summaries = [Summary(id="s", session_id="abc", content="Short summary", created_at="2026-11-08T01:09:00+00:00")]
-    conclusions = [Conclusion(id="c", session_id="abc", content="No change required.", created_at="2026-11-08T01:09:01+00:00")]
+    prompts = [
+        Prompt(
+            id="c",
+            session_id="abc",
+            content="No change required.",
+            created_at="2026-11-08T01:09:01+00:00",
+            author="grok",
+        )
+    ]
     commands = [
         CommandRecord(
             id="cmd",
@@ -63,8 +71,8 @@ def test_export_includes_actor_timestamp_and_content():
             stderr="",
         )
     ]
-    markdown = session_to_markdown(_session(), turns, summaries, conclusions, commands)
-    plain = session_to_plaintext(_session(), turns, summaries, conclusions, commands)
+    markdown = session_to_markdown(_session(), turns, summaries, prompts, commands)
+    plain = session_to_plaintext(_session(), turns, summaries, prompts, commands)
     for text in (markdown, plain):
         assert "Hello local" in text
         assert "2026-11-08T01:02:03+00:00" in text
@@ -74,6 +82,9 @@ def test_export_includes_actor_timestamp_and_content():
         assert "Short summary" in text
         assert "No change required." in text
         assert "printf hi" in text
+    assert "## Prompts" in markdown
+    assert "Grok" in markdown
+    assert "PROMPTS" in plain
 
 
 def test_extract_output_text_and_refusal():

@@ -23,17 +23,18 @@ from monitor_maid.context import (
     build_local_messages,
     build_review_input,
     compose_selection_prompt,
-    conclusion_messages,
+    grok_prompt_messages,
+    normalise_prompt,
     normalise_summary,
-    parse_conclusion_list,
-    seed_records,
+    prompt_messages,
+    seed_draft,
     shutdown_plan,
     summary_messages,
     verification_prompt,
 )
 from monitor_maid.db import Database, utc_now
 from monitor_maid.executor import ExecResult, execute
-from monitor_maid.instructions import parse_instructions, parse_relays, scrub_relay
+from monitor_maid.instructions import parse_instructions, parse_prompts, parse_relays, scrub_relay
 from monitor_maid.models import (
     NO_SUBSTANTIAL,
     ApprovalRequest,
@@ -118,8 +119,12 @@ class Orchestrator(QObject):
             return None
         return self.db.get_session(self.session_id)
 
-    def new_session(self) -> Session:
+    def new_session(self, ollama_model: str | None = None) -> Session:
         settings = Settings.load(self.db)
+        model = (ollama_model or "").strip() or settings.ollama_model
+        if (ollama_model or "").strip() and settings.ollama_model != model:
+            settings.ollama_model = model
+            settings.save(self.db)
         session = self.db.create_session(
             title="New session",
             execution_mode=settings.default_execution_mode,
@@ -127,7 +132,7 @@ class Orchestrator(QObject):
             grok_relay_mode=settings.default_grok_relay_mode,
             grok_relay_limit=settings.default_grok_relay_limit,
             monitor_mode=settings.monitor_default,
-            ollama_model=settings.ollama_model,
+            ollama_model=model,
         )
         self.session_id = session.id
         self.db.set_last_session(session.id)
@@ -190,6 +195,22 @@ class Orchestrator(QObject):
         settings.monitor_default = bool(enabled)
         settings.save(self.db)
         self.session_changed.emit()
+
+    def set_ollama_model(self, model: str) -> None:
+        """Use this model for the open session, and as the default after it."""
+        session = self.current()
+        cleaned = model.strip()
+        if session is None or session.status != "open" or not cleaned:
+            return
+        changed = session.ollama_model != cleaned
+        if changed:
+            self.db.update_session(session.id, ollama_model=cleaned)
+        settings = Settings.load(self.db)
+        if settings.ollama_model != cleaned:
+            settings.ollama_model = cleaned
+            settings.save(self.db)
+        if changed:
+            self.session_changed.emit()
 
     def submit_local(self, text: str) -> bool:
         cleaned = text.strip()
@@ -274,39 +295,19 @@ class Orchestrator(QObject):
         """Ask the local model for a summary and store it. The session stays open."""
         return self._request_note("summary")
 
-    def request_conclusions(self) -> bool:
-        """Ask the local model for conclusions and store them. The session stays open."""
-        return self._request_note("conclusion")
+    def request_prompt(self, author: str = "local_llm") -> bool:
+        """Ask the local model or Grok for a prompt. Store one only if the reply marks it."""
+        if author == "grok":
+            return self._request_note("prompt_grok")
+        return self._request_note("prompt")
 
-    def plant_seed(self, items: list[HistoryItem]) -> bool:
-        """Copy the chosen rows from the database into the open session.
+    def selection_draft(self, items: list[HistoryItem]) -> str:
+        """Reload the chosen rows and return the text for the input box.
 
-        The new turns are ordinary messages, so the next local call sees them
-        and does not see the rest of the session they came from.
+        Nothing is written to the session. The user edits this text and sends
+        it when they are ready.
         """
-        session = self.current()
-        if session is None or session.status != "open":
-            self.status_message.emit("There is no open session to continue.")
-            return False
-        records = seed_records(self._reload_items(items))
-        if not records:
-            self.status_message.emit("Nothing from that selection is still stored.")
-            return False
-        for actor, content, metadata in records:
-            self.db.add_turn(
-                session.id,
-                actor=actor,
-                kind="message",
-                content=content,
-                visible_to_local=True,
-                metadata=metadata,
-            )
-        updated = self.db.get_session(session.id)
-        if updated is not None and updated.title == "New session":
-            self.db.update_session(session.id, title="Continued session")
-        self._emit_session()
-        self.status_message.emit("Started a new session from the selected record.")
-        return True
+        return seed_draft(self._reload_items(items))
 
     def rename_session(self, title: str) -> bool:
         """Keep a name the user chose. Later messages do not replace it."""
@@ -353,17 +354,12 @@ class Orchestrator(QObject):
             return
         self._invalidate_worker()
         if job.session_id:
-            self._store_shutdown(
-                job.session_id,
-                "Summary skipped.",
-                ["Summary skipped."],
-            )
+            self._store_shutdown(job.session_id, "Summary skipped.")
         self._finish_job()
 
     def abandon(self, session_id: str) -> None:
         note = "Session was interrupted and closed without a summary."
         self.db.add_summary(session_id, note)
-        self.db.add_conclusion(session_id, note)
         self.db.add_turn(
             session_id,
             actor="system",
@@ -474,8 +470,10 @@ class Orchestrator(QObject):
                 self._start_local(job.session_id or "", self._then_grok)
             elif job.kind == "make_summary":
                 self._start_manual_summary(job.session_id or "")
-            elif job.kind == "make_conclusion":
-                self._start_manual_conclusions(job.session_id or "")
+            elif job.kind == "make_prompt":
+                self._start_manual_prompt(job.session_id or "")
+            elif job.kind == "make_prompt_grok":
+                self._start_grok_prompt(job.session_id or "")
             else:
                 log.error("unknown job kind %s", job.kind)
                 self._finish_job()
@@ -550,14 +548,7 @@ class Orchestrator(QObject):
 
         def ok(reply: LLMReply) -> None:
             self._retry_kinds.discard("local")
-            turn = self.db.add_turn(
-                sid,
-                actor="local_llm",
-                kind="message",
-                content=reply.text,
-                visible_to_local=True,
-            )
-            self.transcript_changed.emit()
+            turn = self._add_model_reply(sid, reply.text, "local_llm")
             self._begin_instructions(sid, turn.id, reply.text, on_complete)
 
         def err(exc: Exception) -> None:
@@ -601,15 +592,17 @@ class Orchestrator(QObject):
             if gen != self._grok_gen:
                 return
             self._retry_kinds.discard("grok")
-            kind = "refusal" if reply.refused else reply_kind
-            self.db.add_turn(
-                sid,
-                actor="grok",
-                kind=kind,
-                content=reply.text,
-                visible_to_local=False,
-            )
-            self.transcript_changed.emit()
+            if reply.refused:
+                self.db.add_turn(
+                    sid,
+                    actor="grok",
+                    kind="refusal",
+                    content=reply.text,
+                    visible_to_local=False,
+                )
+                self.transcript_changed.emit()
+            else:
+                self._add_model_reply(sid, reply.text, "grok", unmarked_kind=reply_kind)
             if reply.refused:
                 self.status_message.emit("Grok refused the request. Nothing was forwarded.")
                 on_complete()
@@ -1048,15 +1041,25 @@ class Orchestrator(QObject):
         if session.status == "closing":
             self.status_message.emit("This session is already closing.")
             return False
+        if kind == "prompt_grok" and not effective_api_key(Settings.load(self.db)):
+            self.status_message.emit("Add an xAI API key in Settings, or set XAI_API_KEY.")
+            return False
         plan = shutdown_plan(self.db.list_turns(session.id))
         if kind == "summary":
             empty = "There is nothing in this session to summarise yet."
             job_kind = "make_summary"
             preview = "Create summary"
+            label = "Summary"
+        elif kind == "prompt_grok":
+            empty = "There is nothing in this session to make a prompt from yet."
+            job_kind = "make_prompt_grok"
+            preview = "Create prompt with Grok"
+            label = "Prompt"
         else:
-            empty = "There is nothing in this session to draw conclusions from yet."
-            job_kind = "make_conclusion"
-            preview = "Create conclusions"
+            empty = "There is nothing in this session to make a prompt from yet."
+            job_kind = "make_prompt"
+            preview = "Create prompt"
+            label = "Prompt"
         if plan == "skip":
             self.status_message.emit(empty)
             return False
@@ -1064,12 +1067,11 @@ class Orchestrator(QObject):
             if kind == "summary":
                 self._store_manual_summary(session.id, NO_SUBSTANTIAL)
             else:
-                self._store_manual_conclusions(session.id, [NO_SUBSTANTIAL])
+                self.status_message.emit("This session is too short to make a prompt from.")
             return True
         job = Job(kind=job_kind, session_id=session.id, local_text=preview)
         self._enqueue(job)
         if self._job is not job:
-            label = "Summary" if kind == "summary" else "Conclusions"
             self.status_message.emit(f"{label} queued. This session stays open.")
         return True
 
@@ -1106,17 +1108,17 @@ class Orchestrator(QObject):
                 content=summary.content,
                 source_id=summary.id,
             )
-        if item.kind == "conclusion":
-            conclusion = self.db.get_conclusion(item.source_id)
-            if conclusion is None:
+        if item.kind in {"prompt", "conclusion"}:
+            prompt = self.db.get_prompt(item.source_id)
+            if prompt is None:
                 return None
             return HistoryItem(
-                key=item.key or f"conclusion:{conclusion.id}",
-                kind="conclusion",
-                actor="local_llm",
-                created_at=conclusion.created_at,
-                content=conclusion.content,
-                source_id=conclusion.id,
+                key=item.key or f"prompt:{prompt.id}",
+                kind="prompt",
+                actor=prompt.author or "local_llm",
+                created_at=prompt.created_at,
+                content=prompt.content,
+                source_id=prompt.id,
             )
         return None
 
@@ -1138,28 +1140,33 @@ class Orchestrator(QObject):
             self.status_message.emit("Summary stored.")
         log.info("stored manual summary for %s", sid)
 
-    def _store_manual_conclusions(self, sid: str, conclusions: list[str]) -> None:
-        items = [item.strip() for item in conclusions if item and item.strip()] or [NO_SUBSTANTIAL]
-        for item in items:
-            self.db.add_conclusion(sid, item)
-        body = "\n".join(f"- {item}" for item in items)
-        self.db.add_turn(
+    def _add_model_reply(
+        self,
+        sid: str,
+        text: str,
+        author: str,
+        *,
+        unmarked_kind: str = "message",
+    ):
+        """Store a model reply. A prompt record is written only for a closed prompt fence."""
+        bodies = parse_prompts(text)
+        stored_author = "grok" if author == "grok" else "local_llm"
+        turn = self.db.add_turn(
             sid,
-            actor="local_llm",
-            kind="conclusion",
-            content=body,
-            visible_to_local=True,
+            actor=stored_author,
+            kind="prompt" if bodies else unmarked_kind,
+            content=text,
+            visible_to_local=stored_author != "grok",
         )
-        self._emit_session()
-        session = self.db.get_session(sid)
-        count = len(items)
-        if session is not None and session.status == "open":
+        for body in bodies:
+            self.db.add_prompt(sid, normalise_prompt(body), author=stored_author)
+        self.transcript_changed.emit()
+        if bodies:
             self.status_message.emit(
-                f"{count} conclusion{'s' if count != 1 else ''} stored. This session stays open."
+                "Prompt stored." if len(bodies) == 1 else f"{len(bodies)} prompts stored."
             )
-        else:
-            self.status_message.emit(f"{count} conclusion{'s' if count != 1 else ''} stored.")
-        log.info("stored %s manual conclusions for %s", count, sid)
+            log.info("stored %s prompt(s) for %s by %s", len(bodies), sid, stored_author)
+        return turn
 
     def _start_manual_summary(self, sid: str) -> None:
         self.status_message.emit("Asking the local model for a summary…")
@@ -1189,15 +1196,15 @@ class Orchestrator(QObject):
 
         self._run(work, ok, err)
 
-    def _start_manual_conclusions(self, sid: str) -> None:
-        self.status_message.emit("Asking the local model for conclusions…")
+    def _start_manual_prompt(self, sid: str) -> None:
+        self.status_message.emit("Asking the local model for a prompt…")
         session = self.db.get_session(sid)
         if session is None:
             self._finish_job()
             return
         settings = Settings.load(self.db)
         model = session.ollama_model if session.ollama_model else settings.ollama_model
-        messages = conclusion_messages(self.db.list_turns(sid), cwd=self.cwd)
+        messages = prompt_messages(self.db.list_turns(sid), cwd=self.cwd)
         client = OllamaClient(settings.ollama_url)
         timeout = settings.summary_timeout
 
@@ -1208,11 +1215,59 @@ class Orchestrator(QObject):
             if self.db.get_session(sid) is None:
                 self._finish_job()
                 return
-            self._store_manual_conclusions(sid, parse_conclusion_list(reply.text))
+            self._add_model_reply(sid, reply.text, "local_llm")
+            if not parse_prompts(reply.text):
+                self.status_message.emit(
+                    "The reply was not marked as a prompt. No prompt was stored."
+                )
             self._finish_job()
 
         def err(exc: Exception) -> None:
-            self.status_message.emit(f"Could not create conclusions: {exc}")
+            self.status_message.emit(f"Could not create a prompt: {exc}")
+            self._finish_job()
+
+        self._run(work, ok, err)
+
+    def _start_grok_prompt(self, sid: str) -> None:
+        self.status_message.emit("Asking Grok for a prompt…")
+        session = self.db.get_session(sid)
+        if session is None:
+            self._finish_job()
+            return
+        settings = Settings.load(self.db)
+        key = effective_api_key(settings)
+        if not key:
+            self.status_message.emit("Add an xAI API key in Settings, or set XAI_API_KEY.")
+            self._finish_job()
+            return
+        messages = grok_prompt_messages(
+            self.db.list_turns(sid),
+            budget=settings.context_budget,
+        )
+        client = XAIClient(settings.xai_base_url, key)
+        timeout = settings.xai_timeout
+        model = settings.xai_model
+
+        def work() -> LLMReply:
+            return client.complete(model, messages, timeout)
+
+        def ok(reply: LLMReply) -> None:
+            if self.db.get_session(sid) is None:
+                self._finish_job()
+                return
+            if reply.refused:
+                self.status_message.emit("Grok refused the request. Nothing was stored.")
+                self._finish_job()
+                return
+            self._add_model_reply(sid, reply.text, "grok")
+            if not parse_prompts(reply.text):
+                self.status_message.emit(
+                    "The reply was not marked as a prompt. No prompt was stored."
+                )
+            self._finish_job()
+
+        def err(exc: Exception) -> None:
+            self.status_message.emit(f"Could not create a prompt: {exc}")
             self._finish_job()
 
         self._run(work, ok, err)
@@ -1250,7 +1305,7 @@ class Orchestrator(QObject):
             self._finish_job()
             return
         if plan == "note":
-            self._store_shutdown(sid, NO_SUBSTANTIAL, [NO_SUBSTANTIAL])
+            self._store_shutdown(sid, NO_SUBSTANTIAL)
             self._finish_job()
             return
         self._ask_summary(sid)
@@ -1268,37 +1323,17 @@ class Orchestrator(QObject):
             return client.chat(model, messages, timeout)
 
         def ok(reply: LLMReply) -> None:
-            self._ask_conclusions(sid, normalise_summary(reply.text))
-
-        def err(exc: Exception) -> None:
-            self._ask_conclusions(sid, f"Summary unavailable: {exc}")
-
-        self._run(work, ok, err)
-
-    def _ask_conclusions(self, sid: str, summary_text: str) -> None:
-        self.shutdown_progress.emit("Asking the local model for conclusions…")
-        settings = Settings.load(self.db)
-        session = self.db.get_session(sid)
-        model = session.ollama_model if session and session.ollama_model else settings.ollama_model
-        messages = conclusion_messages(self.db.list_turns(sid), cwd=self.cwd)
-        client = OllamaClient(settings.ollama_url)
-        timeout = settings.summary_timeout
-
-        def work() -> LLMReply:
-            return client.chat(model, messages, timeout)
-
-        def ok(reply: LLMReply) -> None:
-            self._store_shutdown(sid, summary_text, parse_conclusion_list(reply.text))
+            self._store_shutdown(sid, normalise_summary(reply.text))
             self._finish_job()
 
         def err(exc: Exception) -> None:
-            self._store_shutdown(sid, summary_text, [f"Conclusions unavailable: {exc}"])
+            self._store_shutdown(sid, f"Summary unavailable: {exc}")
             self._finish_job()
 
         self._run(work, ok, err)
 
     def _close_without_notes(self, sid: str) -> None:
-        """Close the session and leave summaries and conclusions unchanged."""
+        """Close the session and leave summaries and prompts unchanged."""
         turns = self.db.list_turns(sid)
         if not turns:
             self.db.delete_session_if_empty(sid)
@@ -1312,25 +1347,14 @@ class Orchestrator(QObject):
         self.status_message.emit("Session closed without a summary.")
         log.info("closed session %s without a summary", sid)
 
-    def _store_shutdown(self, sid: str, summary: str, conclusions: list[str]) -> None:
+    def _store_shutdown(self, sid: str, summary: str) -> None:
         summary_text = normalise_summary(summary)
-        items = conclusions or [NO_SUBSTANTIAL]
         self.db.add_summary(sid, summary_text)
         self.db.add_turn(
             sid,
             actor="local_llm",
             kind="summary",
             content=summary_text,
-            visible_to_local=True,
-        )
-        for item in items:
-            self.db.add_conclusion(sid, item)
-        body = "\n".join(f"- {item}" for item in items)
-        self.db.add_turn(
-            sid,
-            actor="local_llm",
-            kind="conclusion",
-            content=body,
             visible_to_local=True,
         )
         self.db.mark_closed(sid)

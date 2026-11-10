@@ -7,20 +7,17 @@ Grok sees the local transcript as quoted text, never as its own assistant turns.
 
 from __future__ import annotations
 
-import json
-import re
-
 from monitor_maid.models import (
     NO_SUBSTANTIAL,
-    Conclusion,
     HistoryItem,
+    Prompt,
     Summary,
     Turn,
 )
 from monitor_maid.instructions import scrub_relay
 from monitor_maid.prompts import (
-    CONCLUSION_INSTRUCTION,
     GROK_SYSTEM_PROMPT,
+    PROMPT_INSTRUCTION,
     SUMMARY_INSTRUCTION,
     local_system_prompt,
 )
@@ -35,7 +32,7 @@ def shutdown_plan(turns: list[Turn]) -> str:
 
     skip: nothing was stored; the caller may delete the empty session.
     note: something was stored, but it is too thin to send to the model.
-    ask: ask the local model for a summary and conclusions.
+    ask: ask the local model for a summary.
     """
     if not turns:
         return "skip"
@@ -61,6 +58,7 @@ def build_local_messages(turns: list[Turn], *, cwd: str | None = None) -> list[d
             continue
         if turn.kind in {"summary", "conclusion", "review", "verification", "refusal"}:
             # Shutdown notes are not part of the live chat the model continues.
+            # A reply marked as a prompt stays in the conversation.
             continue
         if turn.actor == "local_llm":
             messages.append({"role": "assistant", "content": turn.content})
@@ -77,10 +75,26 @@ def summary_messages(turns: list[Turn], *, cwd: str | None = None) -> list[dict[
     return messages
 
 
-def conclusion_messages(turns: list[Turn], *, cwd: str | None = None) -> list[dict[str, str]]:
+def prompt_messages(turns: list[Turn], *, cwd: str | None = None) -> list[dict[str, str]]:
     messages = build_local_messages(turns, cwd=cwd)
-    messages.append({"role": "user", "content": CONCLUSION_INSTRUCTION})
+    messages.append({"role": "user", "content": PROMPT_INSTRUCTION})
     return messages
+
+
+def grok_prompt_messages(turns: list[Turn], *, budget: int) -> list[dict[str, str]]:
+    """Ask Grok for one prompt. The local transcript is quoted, not a relay."""
+    transcript = format_transcript(turns, budget)
+    return [
+        {"role": "system", "content": GROK_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                PROMPT_INSTRUCTION
+                + "\n\nLocal transcript (the local model cannot see you):\n\n"
+                + transcript
+            ),
+        },
+    ]
 
 
 def _clip(text: str, limit: int) -> str:
@@ -195,42 +209,39 @@ def build_review_input(turns: list[Turn], command: str, *, budget: int) -> list[
     ]
 
 
-def seed_records(items: list[HistoryItem]) -> list[tuple[str, str, dict]]:
-    """Turns to plant in a new session so the local model sees a short record.
+_DRAFT_LABELS = {
+    "question": "Question",
+    "answer": "Answer",
+    "summary": "Summary",
+    "prompt": "Prompt",
+    "conclusion": "Prompt",
+    "grok": "Note",
+}
 
-    Each record is ``(actor, content, metadata)``. Store them as kind
-    ``message`` so later local calls include them. A summary or conclusion
-    stored on the old session stays out of that session's local context.
+
+def seed_draft(items: list[HistoryItem]) -> str:
+    """Text for the input box when a new session starts from selected history.
+
+    One item is the text itself, so it can be edited and then sent. Several
+    items stay in order, each with a label. A Grok note has a leading
+    attribution removed, because this text may be sent to the local model.
     """
-    records: list[tuple[str, str, dict]] = []
+    blocks: list[tuple[str, str]] = []
     for item in items:
         text = (item.content or "").strip()
+        if item.kind == "grok":
+            text = scrub_relay(text).strip()
         if not text:
             continue
-        meta = {"seed": True, "source_kind": item.kind, "source_id": item.source_id}
-        if item.kind == "question":
-            records.append(("user", text, meta))
-        elif item.kind == "answer":
-            records.append(("local_llm", text, meta))
-        elif item.kind == "summary":
-            records.append(("user", "Summary of an earlier session:\n\n" + text, meta))
-        elif item.kind == "conclusion":
-            records.append(("user", "Conclusion from an earlier session:\n\n" + text, meta))
-        elif item.kind == "grok":
-            note = scrub_relay(text).strip()
-            if not note:
-                continue
-            records.append(("user", "Note:\n\n" + note, meta))
-    if records and records[0][0] != "user":
-        records.insert(
-            0,
-            (
-                "user",
-                "Continue from the earlier replies below.",
-                {"seed": True, "source_kind": "preamble"},
-            ),
-        )
-    return records
+        blocks.append((item.kind, text))
+    if not blocks:
+        return ""
+    if len(blocks) == 1:
+        return blocks[0][1]
+    parts = []
+    for kind, text in blocks:
+        parts.append(f"{_DRAFT_LABELS.get(kind, 'Note')}\n{text}")
+    return "\n\n".join(parts)
 
 
 def compose_selection_prompt(
@@ -264,48 +275,15 @@ def verification_prompt(items: list[HistoryItem], question: str) -> str:
     custom = question.strip() or (
         f"Verify the selected {listed} against the local transcript. "
         "For each item say whether it is supported, only partly supported, or unsupported, "
-        "and quote the part of the transcript you used. Do not add new conclusions."
+        "and quote the part of the transcript you used. Do not add new claims."
     )
     return compose_selection_prompt(items, custom)
-
-
-def parse_conclusion_list(text: str) -> list[str]:
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return [NO_SUBSTANTIAL]
-    if cleaned.lower().rstrip(".") == NO_SUBSTANTIAL.lower().rstrip("."):
-        return [NO_SUBSTANTIAL]
-    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
-    candidates = [fenced.strip()]
-    match = re.search(r"(\[[\s\S]*\])", fenced)
-    if match:
-        candidates.append(match.group(1))
-    object_match = re.search(r"(\{[\s\S]*\})", fenced)
-    if object_match:
-        candidates.append(object_match.group(1))
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, list):
-            items = [str(item).strip() for item in value if str(item).strip()]
-            return items or [NO_SUBSTANTIAL]
-        if isinstance(value, dict) and isinstance(value.get("conclusions"), list):
-            items = [str(item).strip() for item in value["conclusions"] if str(item).strip()]
-            return items or [NO_SUBSTANTIAL]
-    lines = []
-    for line in cleaned.splitlines():
-        stripped = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-        if stripped:
-            lines.append(stripped)
-    return lines or [NO_SUBSTANTIAL]
 
 
 def build_history_items(
     turns: list[Turn],
     summaries: list[Summary],
-    conclusions: list[Conclusion],
+    prompts: list[Prompt],
 ) -> list[HistoryItem]:
     items: list[HistoryItem] = []
     for turn in turns:
@@ -338,15 +316,15 @@ def build_history_items(
                 source_id=summary.id,
             )
         )
-    for conclusion in conclusions:
+    for prompt in prompts:
         items.append(
             HistoryItem(
-                key=f"conclusion:{conclusion.id}",
-                kind="conclusion",
-                actor="local_llm",
-                created_at=conclusion.created_at,
-                content=conclusion.content,
-                source_id=conclusion.id,
+                key=f"prompt:{prompt.id}",
+                kind="prompt",
+                actor=prompt.author or "local_llm",
+                created_at=prompt.created_at,
+                content=prompt.content,
+                source_id=prompt.id,
             )
         )
     items.sort(key=lambda item: item.created_at)
@@ -358,3 +336,7 @@ def normalise_summary(text: str | None) -> str:
     if not cleaned:
         return NO_SUBSTANTIAL
     return cleaned
+
+
+def normalise_prompt(text: str | None) -> str:
+    return normalise_summary(text)

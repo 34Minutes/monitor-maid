@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import threading
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QTextDocument
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QTextCursor, QTextDocument
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -32,6 +33,7 @@ from monitor_maid.context import build_history_items
 from monitor_maid.db import Database
 from monitor_maid.export import selection_to_markdown, session_to_html, session_to_markdown, session_to_plaintext
 from monitor_maid.models import MODE_LABELS, HistoryItem
+from monitor_maid.ollama_client import OllamaClient, OllamaError, apply_model_switch, same_model
 from monitor_maid.orchestrator import Orchestrator
 from monitor_maid.paths import process_log_dir
 from monitor_maid.ui.command_log import CommandLog
@@ -42,7 +44,9 @@ from monitor_maid.ui.dialogs import (
     NoteDialog,
     NotesBrowser,
     RecoveryDialog,
+    SeedModelDialog,
     SettingsDialog,
+    model_choices,
     seed_button_label,
 )
 from monitor_maid.ui.history_panel import HistoryPanel
@@ -50,7 +54,28 @@ from monitor_maid.ui.hooks import WindowHooks
 from monitor_maid.ui.transcript import TranscriptView
 
 
+class ModelCombo(QComboBox):
+    """Model list. Opening it asks Ollama for `ollama list` again."""
+
+    def showPopup(self) -> None:  # noqa: N802
+        window = self.window()
+        refresh = getattr(window, "_refresh_model_list", None)
+        if callable(refresh):
+            refresh()
+        super().showPopup()
+
+    def hidePopup(self) -> None:  # noqa: N802
+        super().hidePopup()
+        window = self.window()
+        if getattr(window, "_model_names_pending", False):
+            window._model_names_pending = False
+            window._fill_model_combo()
+
+
 class MainWindow(QMainWindow):
+    _models_listed = pyqtSignal(int, str)
+    _model_switch_done = pyqtSignal(int, str)
+
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
@@ -60,6 +85,15 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._loading = False
         self._seed_after_new: list[HistoryItem] | None = None
+        self._seed_model: str | None = None
+        self._model_names: list[str] = []
+        self._model_names_pending = False
+        self._model_list_gen = 0
+        self._model_applied = False
+        self._active_model = ""
+        self._switch_gen = 0
+        self._switch_reported = 0
+        self._switch_lock = threading.Lock()
         self.hooks = WindowHooks(lambda: self)
         self.orchestrator = Orchestrator(
             db,
@@ -83,6 +117,13 @@ class MainWindow(QMainWindow):
         strip_layout = QVBoxLayout(strip)
         strip_layout.setContentsMargins(8, 8, 8, 8)
         row1 = QHBoxLayout()
+        self.model_combo = ModelCombo()
+        self.model_combo.setObjectName("modelCombo")
+        self.model_combo.setMinimumWidth(200)
+        self.model_combo.setMaximumWidth(360)
+        self.model_combo.setToolTip(
+            "Models installed in Ollama. Choosing one unloads the others and loads this one."
+        )
         self.session_combo = QComboBox()
         self.session_combo.setObjectName("sessionCombo")
         self.session_combo.setMinimumWidth(260)
@@ -93,6 +134,10 @@ class MainWindow(QMainWindow):
         self.end_button = QPushButton("End session")
         self.reopen_button = QPushButton("Reopen")
         self.settings_button = QPushButton("Settings")
+        model_label = QLabel("Model")
+        model_label.setObjectName("modelLabel")
+        row1.addWidget(model_label)
+        row1.addWidget(self.model_combo)
         row1.addWidget(QLabel("Session"))
         row1.addWidget(self.session_combo, 1)
         row1.addWidget(self.rename_button)
@@ -141,6 +186,9 @@ class MainWindow(QMainWindow):
         root.addWidget(strip)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("mainSplit")
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -169,6 +217,7 @@ class MainWindow(QMainWindow):
         self.ollama_hint.setWordWrap(True)
         self.ollama_hint.hide()
         self.composer = Composer()
+        self.composer.set_enter_submits(self.db.get_setting("enter_submits", "1") != "0")
         left_layout.addWidget(legend)
         left_layout.addWidget(self.transcript, 1)
         self.history = HistoryPanel()
@@ -217,24 +266,27 @@ class MainWindow(QMainWindow):
         self.act_rename.setObjectName("renameSessionAction")
         self.act_create_summary = QAction("Create summary", self)
         self.act_create_summary.setObjectName("createSummary")
-        self.act_create_conclusions = QAction("Create conclusions", self)
-        self.act_create_conclusions.setObjectName("createConclusions")
+        self.act_create_prompt = QAction("Create prompt", self)
+        self.act_create_prompt.setObjectName("createPrompt")
+        self.act_create_prompt_grok = QAction("Create prompt with Grok", self)
+        self.act_create_prompt_grok.setObjectName("createPromptGrok")
         self.act_browse = QAction("Browse sessions…", self)
         self.act_browse.setObjectName("browseNotes")
         self.act_view_summary = QAction("View summary", self)
         self.act_view_summary.setObjectName("viewSummary")
-        self.act_view_conclusion = QAction("View conclusion", self)
-        self.act_view_conclusion.setObjectName("viewConclusion")
+        self.act_view_prompt = QAction("View prompt", self)
+        self.act_view_prompt.setObjectName("viewPrompt")
         self.act_from_checked = QAction("New session from checked items", self)
         self.act_from_checked.setObjectName("newFromChecked")
         menu.addAction(self.act_rename)
         menu.addSeparator()
         menu.addAction(self.act_create_summary)
-        menu.addAction(self.act_create_conclusions)
+        menu.addAction(self.act_create_prompt)
+        menu.addAction(self.act_create_prompt_grok)
         menu.addSeparator()
         menu.addAction(self.act_browse)
         menu.addAction(self.act_view_summary)
-        menu.addAction(self.act_view_conclusion)
+        menu.addAction(self.act_view_prompt)
         menu.addSeparator()
         menu.addAction(self.act_from_checked)
 
@@ -252,6 +304,12 @@ class MainWindow(QMainWindow):
         orch.accepting_changed.connect(self._apply_accepting)
         orch.shutdown_active.connect(self._show_shutdown)
         orch.shutdown_progress.connect(self.progress.setLabelText)
+        self._models_listed.connect(self._on_models_listed, Qt.ConnectionType.QueuedConnection)
+        self._model_switch_done.connect(
+            self._on_model_switch,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.model_combo.activated.connect(self._model_activated)
         self.session_combo.currentIndexChanged.connect(self._session_picked)
         self.rename_button.clicked.connect(self._rename_session)
         self.act_rename.triggered.connect(self._rename_session)
@@ -270,16 +328,18 @@ class MainWindow(QMainWindow):
         self.composer.send_local.connect(self._send_local)
         self.composer.send_grok.connect(self._send_grok)
         self.composer.send_both.connect(self._send_both)
+        self.composer.enter_mode_changed.connect(self._save_enter_mode)
         self.history.ask_grok.clicked.connect(self._ask_grok)
         self.history.ask_local.clicked.connect(self._ask_local)
         self.history.verify.clicked.connect(self._verify)
         self.history.new_from_checked.connect(self._new_from_checked)
         self.history.view_item.connect(self._view_history_item)
         self.act_create_summary.triggered.connect(self._create_summary)
-        self.act_create_conclusions.triggered.connect(self._create_conclusions)
+        self.act_create_prompt.triggered.connect(self._create_prompt)
+        self.act_create_prompt_grok.triggered.connect(self._create_prompt_grok)
         self.act_browse.triggered.connect(self._browse_notes)
         self.act_view_summary.triggered.connect(lambda: self._view_latest("summary"))
-        self.act_view_conclusion.triggered.connect(lambda: self._view_latest("conclusion"))
+        self.act_view_prompt.triggered.connect(lambda: self._view_latest("prompt"))
         self.act_from_checked.triggered.connect(self._new_from_checked)
         self.progress.canceled.connect(self.orchestrator.cancel_shutdown)
 
@@ -296,11 +356,13 @@ class MainWindow(QMainWindow):
                         self.db.reopen_session(sid)
                     self.orchestrator.select_session(sid)
                     self.orchestrator.check_ollama()
+                    self._refresh_model_list()
                     return
                 if dialog.choice == "summarise":
                     self.orchestrator.select_session(sid)
                     self.orchestrator.request_end(self._after_recovery, session_id=sid)
                     self.orchestrator.check_ollama()
+                    self._refresh_model_list()
                     return
                 self.orchestrator.abandon(sid)
         if self.orchestrator.current() is None:
@@ -308,6 +370,7 @@ class MainWindow(QMainWindow):
         self._reload_sessions()
         self._reload_session_controls()
         self.orchestrator.check_ollama()
+        self._refresh_model_list()
 
     def _after_recovery(self) -> None:
         self.orchestrator.accepting = True
@@ -354,12 +417,19 @@ class MainWindow(QMainWindow):
             f"forward {session.grok_relay_used}/{session.grok_relay_limit}"
         )
         model = session.ollama_model or Settings.load(self.db).ollama_model
+        self._fill_model_combo(model)
+        open_session = session.status == "open"
+        self.model_combo.setEnabled(
+            open_session and self.orchestrator.accepting and not self.orchestrator.busy
+        )
         self.setWindowTitle(f"Monitor Maid — {session.title}")
-        self.status_label.setText(f"{session.status}  ·  {model}")
+        if self._switch_gen == self._switch_reported:
+            self.status_label.setText(f"{session.status}  ·  {model}")
         self._loading = False
         self._apply_grok_gate()
         self._reload_transcript()
         self._reload_commands()
+        self._consider_model_switch(model)
 
     def _reload_transcript(self) -> None:
         session = self.orchestrator.current()
@@ -373,7 +443,7 @@ class MainWindow(QMainWindow):
             build_history_items(
                 turns,
                 self.db.list_summaries(session.id),
-                self.db.list_conclusions(session.id),
+                self.db.list_prompts(session.id),
             )
         )
 
@@ -383,6 +453,127 @@ class MainWindow(QMainWindow):
             self.commands.set_records([])
             return
         self.commands.set_records(self.db.list_commands(session.id))
+
+    def _fill_model_combo(self, current: str | None = None) -> None:
+        if current is None:
+            session = self.orchestrator.current()
+            if session and session.ollama_model:
+                current = session.ollama_model
+            else:
+                current = Settings.load(self.db).ollama_model
+        chosen, names = model_choices(current or "", self._model_names)
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        if names:
+            self.model_combo.addItems(names)
+            index = self.model_combo.findText(chosen)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+        self.model_combo.blockSignals(False)
+
+    def _refresh_model_list(self) -> None:
+        """Ask Ollama for the installed models. This is `ollama list`."""
+        self._model_list_gen += 1
+        generation = self._model_list_gen
+        url = Settings.load(self.db).ollama_url
+
+        def work() -> None:
+            try:
+                names = OllamaClient(url).list_models()
+                payload = "\n".join(names)
+            except OllamaError as exc:
+                payload = "ERROR\n" + str(exc)
+            except Exception as exc:  # noqa: BLE001 — the list is optional
+                payload = "ERROR\n" + str(exc)
+            try:
+                self._models_listed.emit(generation, payload)
+            except RuntimeError:
+                return
+
+        threading.Thread(target=work, name="monitor-maid-models", daemon=True).start()
+
+    def _on_models_listed(self, generation: int, payload: str) -> None:
+        if generation != self._model_list_gen or self._quitting or self._quit_done:
+            return
+        error = ""
+        if payload.startswith("ERROR\n"):
+            error = payload.split("\n", 1)[1]
+        else:
+            names = [line.strip() for line in payload.splitlines() if line.strip()]
+            if names:
+                self._model_names = names
+        if self.model_combo.view().isVisible():
+            self._model_names_pending = True
+            return
+        self._fill_model_combo()
+        if error and not self._model_names:
+            self.model_combo.setToolTip(error)
+        elif self._model_names:
+            self.model_combo.setToolTip(
+                "Models installed in Ollama. Choosing one unloads the others and loads this one."
+            )
+
+    def _model_activated(self, index: int) -> None:
+        if self._loading:
+            return
+        name = self.model_combo.itemText(index).strip()
+        if not name:
+            return
+        self.orchestrator.set_ollama_model(name)
+
+    def _consider_model_switch(self, model: str) -> None:
+        if not model:
+            return
+        if not self._model_applied:
+            self._model_applied = True
+            self._active_model = model
+            return
+        if same_model(model, self._active_model):
+            self._active_model = model
+            return
+        previous = self._active_model
+        self._active_model = model
+        self._begin_model_switch(model, previous)
+
+    def _begin_model_switch(self, target: str, previous: str | None) -> None:
+        self._switch_gen += 1
+        generation = self._switch_gen
+        url = Settings.load(self.db).ollama_url
+        self.status_label.setText(f"Stopping other models and starting {target}…")
+
+        def work() -> None:
+            try:
+                with self._switch_lock:
+                    if generation != self._switch_gen:
+                        return
+                    apply_model_switch(OllamaClient(url), target, previous)
+                message = f"{target} is loaded."
+            except Exception as exc:  # noqa: BLE001 — the status line is the report
+                message = str(exc) or "The model could not be changed."
+            try:
+                self._model_switch_done.emit(generation, message)
+            except RuntimeError:
+                return
+
+        threading.Thread(target=work, name="monitor-maid-model", daemon=True).start()
+
+    def _on_model_switch(self, generation: int, message: str) -> None:
+        if generation != self._switch_gen or self._quitting or self._quit_done:
+            return
+        self._switch_reported = generation
+        self.status_label.setText(message)
+
+    def _ask_seed_model(self) -> str | None:
+        session = self.orchestrator.current()
+        current = ""
+        if session and session.ollama_model:
+            current = session.ollama_model
+        else:
+            current = Settings.load(self.db).ollama_model
+        dialog = SeedModelDialog(self._model_names, current, self)
+        if not dialog.exec():
+            return None
+        return dialog.choice or None
 
     def _session_picked(self) -> None:
         if self._loading:
@@ -436,8 +627,14 @@ class MainWindow(QMainWindow):
     def _create_summary(self) -> None:
         self.orchestrator.request_summary()
 
-    def _create_conclusions(self) -> None:
-        self.orchestrator.request_conclusions()
+    def _save_enter_mode(self, enabled: bool) -> None:
+        self.db.set_setting("enter_submits", "1" if enabled else "0")
+
+    def _create_prompt(self) -> None:
+        self.orchestrator.request_prompt("local_llm")
+
+    def _create_prompt_grok(self) -> None:
+        self.orchestrator.request_prompt("grok")
 
     def _browse_notes(self) -> None:
         protected = None
@@ -477,29 +674,29 @@ class MainWindow(QMainWindow):
             for item in build_history_items(
                 [],
                 self.db.list_summaries(session.id),
-                self.db.list_conclusions(session.id),
+                self.db.list_prompts(session.id),
             )
             if item.kind == kind
         ]
-        title = "Summary" if kind == "summary" else "Conclusion"
+        title = "Summary" if kind == "summary" else "Prompt"
         if not items:
             QMessageBox.information(self, title, f"This session has no {kind} yet.")
             return
-        if kind == "conclusion":
-            body = "\n".join(f"- {item.content}" for item in items)
+        if kind == "prompt":
+            body = "\n\n".join(item.content for item in items)
             label = (
-                "Start a new session with this conclusion"
+                "Start a new session with this prompt"
                 if len(items) == 1
-                else "Start a new session with these conclusions"
+                else "Start a new session with these prompts"
             )
             heading = (
-                "Conclusion stored in this session."
+                "Prompt stored in this session."
                 if len(items) == 1
-                else f"{len(items)} conclusions stored in this session."
+                else f"{len(items)} prompts stored in this session."
             )
             self._show_notes(
                 items,
-                title="Conclusion" if len(items) == 1 else "Conclusions",
+                title="Prompt" if len(items) == 1 else "Prompts",
                 heading=heading,
                 body=body,
                 seed_label=label,
@@ -516,11 +713,11 @@ class MainWindow(QMainWindow):
     def _view_history_item(self, item: object) -> None:
         if not isinstance(item, HistoryItem):
             return
-        title = "Summary" if item.kind == "summary" else "Conclusion"
+        title = "Summary" if item.kind == "summary" else "Prompt"
         self._show_note(item, heading=f"{title} from this session.")
 
     def _show_note(self, item: HistoryItem, *, heading: str) -> None:
-        title = "Summary" if item.kind == "summary" else "Conclusion"
+        title = "Summary" if item.kind == "summary" else "Prompt"
         self._show_notes(
             [item],
             title=title,
@@ -548,7 +745,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "History",
-                "Tick at least one history row. The new session contains only those rows.",
+                "Tick at least one history row. The chosen rows are placed in the input box of a new session.",
             )
             return
         self._start_from_items(items)
@@ -557,13 +754,16 @@ class MainWindow(QMainWindow):
         if self.orchestrator.busy or not self.orchestrator.accepting:
             self.status_label.setText("Wait for the current reply before starting a new session.")
             return
+        model = self._ask_seed_model()
+        if not model:
+            return
         held = list(items)
         session = self.orchestrator.current()
         if session and session.status == "open" and self.db.list_turns(session.id):
             box = QMessageBox(self)
             box.setWindowTitle("New session")
             box.setText(
-                "This session is still open. The new session will contain only what you chose."
+                "This session is still open. A new session will start with what you chose in the input box."
             )
             leave = box.addButton("Leave it open", QMessageBox.ButtonRole.AcceptRole)
             end_first = box.addButton("End it first", QMessageBox.ButtonRole.DestructiveRole)
@@ -572,32 +772,50 @@ class MainWindow(QMainWindow):
             clicked = box.clickedButton()
             if clicked is end_first:
                 self._seed_after_new = held
+                self._seed_model = model
                 self.orchestrator.request_end(self._end_then_seed)
                 return
             if clicked is not leave:
                 return
-        self._plant_in_fresh_session(held)
+        self._plant_in_fresh_session(held, model)
 
     def _end_then_seed(self) -> None:
         self.orchestrator.accepting = True
         self.orchestrator.accepting_changed.emit(True)
         items = self._seed_after_new or []
+        model = self._seed_model
         self._seed_after_new = None
-        self.orchestrator.new_session()
-        self.orchestrator.plant_seed(items)
-        self.composer.local_edit.setFocus()
+        self._seed_model = None
+        self.orchestrator.new_session(ollama_model=model)
+        self._put_selection_in_input(items)
 
-    def _plant_in_fresh_session(self, items: list[HistoryItem]) -> None:
+    def _plant_in_fresh_session(self, items: list[HistoryItem], model: str) -> None:
         session = self.orchestrator.current()
         reuse = (
             session is not None
             and session.status == "open"
             and not self.db.list_turns(session.id)
         )
-        if not reuse:
-            self.orchestrator.new_session()
-        if self.orchestrator.plant_seed(items):
-            self.composer.local_edit.setFocus()
+        if reuse:
+            if model and (session.ollama_model or "") != model:
+                self.orchestrator.set_ollama_model(model)
+        else:
+            self.orchestrator.new_session(ollama_model=model)
+        self._put_selection_in_input(items)
+
+    def _put_selection_in_input(self, items: list[HistoryItem]) -> None:
+        """Place the chosen history in the local input. Nothing is sent yet."""
+        text = self.orchestrator.selection_draft(items)
+        if not text.strip():
+            self.status_label.setText("Nothing from that selection is still stored.")
+            return
+        edit = self.composer.local_edit
+        edit.setPlainText(text)
+        cursor = edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        edit.setTextCursor(cursor)
+        edit.setFocus()
+        self.status_label.setText("The selection is in the input box. Edit it, then send.")
 
     def _end_session(self) -> None:
         session = self.orchestrator.current()
@@ -714,7 +932,7 @@ class MainWindow(QMainWindow):
             session,
             self.db.list_turns(session.id),
             self.db.list_summaries(session.id),
-            self.db.list_conclusions(session.id),
+            self.db.list_prompts(session.id),
             self.db.list_commands(session.id),
         )
 
@@ -749,11 +967,11 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        session, turns, summaries, conclusions, commands = bundle
+        session, turns, summaries, prompts, commands = bundle
         if path.endswith(".txt") or "Plain" in selected_filter:
-            text = session_to_plaintext(session, turns, summaries, conclusions, commands)
+            text = session_to_plaintext(session, turns, summaries, prompts, commands)
         else:
-            text = session_to_markdown(session, turns, summaries, conclusions, commands)
+            text = session_to_markdown(session, turns, summaries, prompts, commands)
         _write(path, text)
         self.status_label.setText(f"Exported {path}")
 
@@ -761,9 +979,9 @@ class MainWindow(QMainWindow):
         bundle = self._bundle()
         if bundle is None:
             return
-        session, turns, summaries, conclusions, commands = bundle
+        session, turns, summaries, prompts, commands = bundle
         document = QTextDocument()
-        document.setHtml(session_to_html(session, turns, summaries, conclusions, commands))
+        document.setHtml(session_to_html(session, turns, summaries, prompts, commands))
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         dialog = QPrintDialog(printer, self)
         if dialog.exec():
@@ -787,6 +1005,7 @@ class MainWindow(QMainWindow):
         ready = bool(effective_api_key(Settings.load(self.db)))
         missing = "Add an xAI API key in Settings, or set XAI_API_KEY."
         self.composer.set_grok_available(ready)
+        self._sync_prompt_grok_action()
         self.monitor_button.setEnabled(ready)
         self.monitor_button.setToolTip(self._monitor_tip if ready else missing)
         self.relay_mode.setEnabled(ready)
@@ -821,12 +1040,27 @@ class MainWindow(QMainWindow):
         self._apply_grok_gate()
 
     def _set_session_actions(self, enabled: bool) -> None:
+        session = self.orchestrator.current()
+        open_session = session is not None and session.status == "open"
+        self.model_combo.setEnabled(enabled and open_session)
         self.session_combo.setEnabled(enabled)
         self.new_button.setEnabled(enabled)
         self.history.can_start = enabled
         self.act_create_summary.setEnabled(enabled)
-        self.act_create_conclusions.setEnabled(enabled)
+        self.act_create_prompt.setEnabled(enabled)
         self.act_from_checked.setEnabled(enabled)
+        self._sync_prompt_grok_action()
+
+    def _sync_prompt_grok_action(self) -> None:
+        ready = bool(effective_api_key(Settings.load(self.db)))
+        session = self.orchestrator.current()
+        open_session = session is not None and session.status == "open"
+        self.act_create_prompt_grok.setEnabled(
+            ready and open_session and self.orchestrator.accepting and not self.orchestrator.busy
+        )
+        self.act_create_prompt_grok.setToolTip(
+            "" if ready else "Add an xAI API key in Settings, or set XAI_API_KEY."
+        )
 
     def _show_shutdown(self, active: bool) -> None:
         self.progress.blockSignals(True)

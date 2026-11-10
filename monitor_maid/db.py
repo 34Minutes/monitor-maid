@@ -12,7 +12,7 @@ from typing import Any
 
 from monitor_maid.models import (
     CommandRecord,
-    Conclusion,
+    Prompt,
     ProcessRecord,
     Session,
     Summary,
@@ -62,11 +62,12 @@ CREATE TABLE IF NOT EXISTS summaries (
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS conclusions (
+CREATE TABLE IF NOT EXISTS prompts (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id),
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT 'local_llm'
 );
 
 CREATE TABLE IF NOT EXISTS commands (
@@ -101,7 +102,7 @@ CREATE TABLE IF NOT EXISTS processes (
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_commands_session ON commands(session_id, proposed_at);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
-CREATE INDEX IF NOT EXISTS idx_conclusions_session ON conclusions(session_id);
+CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id);
 """
 
 _SESSION_FIELDS = {
@@ -145,10 +146,58 @@ class Database:
         self._conn.close()
 
     def migrate(self) -> None:
+        self._rename_conclusions_to_prompts()
         self._conn.executescript(SCHEMA)
+        self._finish_prompt_migration()
         if not self.get_setting("schema_version"):
             self.set_setting("schema_version", "1")
         self._conn.commit()
+
+    def _table_names(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _rename_conclusions_to_prompts(self) -> None:
+        names = self._table_names()
+        if "conclusions" in names and "prompts" not in names:
+            self._conn.execute("ALTER TABLE conclusions RENAME TO prompts")
+
+    def _finish_prompt_migration(self) -> None:
+        names = self._table_names()
+        if "conclusions" in names and "prompts" in names:
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(conclusions)").fetchall()
+            }
+            if "author" in columns:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO prompts "
+                    "(id, session_id, content, created_at, author) "
+                    "SELECT id, session_id, content, created_at, author FROM conclusions"
+                )
+            else:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO prompts "
+                    "(id, session_id, content, created_at, author) "
+                    "SELECT id, session_id, content, created_at, 'local_llm' FROM conclusions"
+                )
+            self._conn.execute("DROP TABLE conclusions")
+        if "prompts" in self._table_names():
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(prompts)").fetchall()
+            }
+            if "author" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE prompts ADD COLUMN author TEXT NOT NULL DEFAULT 'local_llm'"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id)"
+            )
+        self._conn.execute("UPDATE turns SET kind = 'prompt' WHERE kind = 'conclusion'")
+        self._conn.execute("DROP INDEX IF EXISTS idx_conclusions_session")
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -266,7 +315,7 @@ class Database:
             ).fetchall()
         ]
         try:
-            for table in ("commands", "turns", "summaries", "conclusions", "processes"):
+            for table in ("commands", "turns", "summaries", "prompts", "processes"):
                 self._conn.execute(
                     f"DELETE FROM {table} WHERE session_id = ?",
                     (session_id,),
@@ -372,16 +421,22 @@ class Database:
         self._conn.commit()
         return Summary(id=summary_id, session_id=session_id, content=content, created_at=now)
 
-    def add_conclusion(self, session_id: str, content: str) -> Conclusion:
+    def add_prompt(self, session_id: str, content: str, author: str = "local_llm") -> Prompt:
         now = utc_now()
-        conclusion_id = _new_id()
+        prompt_id = _new_id()
+        stored_author = author if author in {"local_llm", "grok"} else "local_llm"
         self._conn.execute(
-            "INSERT INTO conclusions (id, session_id, content, created_at) VALUES (?, ?, ?, ?)",
-            (conclusion_id, session_id, content, now),
+            "INSERT INTO prompts (id, session_id, content, created_at, author) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (prompt_id, session_id, content, now, stored_author),
         )
         self._conn.commit()
-        return Conclusion(
-            id=conclusion_id, session_id=session_id, content=content, created_at=now
+        return Prompt(
+            id=prompt_id,
+            session_id=session_id,
+            content=content,
+            created_at=now,
+            author=stored_author,
         )
 
     def get_summary(self, summary_id: str) -> Summary | None:
@@ -412,33 +467,20 @@ class Database:
             for row in rows
         ]
 
-    def get_conclusion(self, conclusion_id: str) -> Conclusion | None:
+    def get_prompt(self, prompt_id: str) -> Prompt | None:
         row = self._conn.execute(
-            "SELECT * FROM conclusions WHERE id = ?", (conclusion_id,)
+            "SELECT * FROM prompts WHERE id = ?", (prompt_id,)
         ).fetchone()
         if row is None:
             return None
-        return Conclusion(
-            id=row["id"],
-            session_id=row["session_id"],
-            content=row["content"],
-            created_at=row["created_at"],
-        )
+        return _prompt(row)
 
-    def list_conclusions(self, session_id: str) -> list[Conclusion]:
+    def list_prompts(self, session_id: str) -> list[Prompt]:
         rows = self._conn.execute(
-            "SELECT * FROM conclusions WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM prompts WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
-        return [
-            Conclusion(
-                id=row["id"],
-                session_id=row["session_id"],
-                content=row["content"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [_prompt(row) for row in rows]
 
     def add_command(self, record: CommandRecord) -> CommandRecord:
         self._conn.execute(
@@ -617,6 +659,19 @@ def _turn(row: sqlite3.Row) -> Turn:
         created_at=row["created_at"],
         visible_to_local=bool(row["visible_to_local"]),
         metadata=metadata,
+    )
+
+
+def _prompt(row: sqlite3.Row) -> Prompt:
+    author = "local_llm"
+    if "author" in row.keys() and row["author"] in {"local_llm", "grok"}:
+        author = str(row["author"])
+    return Prompt(
+        id=row["id"],
+        session_id=row["session_id"],
+        content=row["content"],
+        created_at=row["created_at"],
+        author=author,
     )
 
 

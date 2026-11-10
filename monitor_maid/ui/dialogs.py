@@ -35,7 +35,7 @@ from monitor_maid.models import (
     ForwardRequest,
     HistoryItem,
 )
-from monitor_maid.ollama_client import OllamaClient
+from monitor_maid.ollama_client import OllamaClient, same_model
 from monitor_maid.policy import compile_denylist
 from monitor_maid.xai_client import XAIClient
 
@@ -74,7 +74,7 @@ class RecoveryDialog(QDialog):
 
 
 class EndSessionDialog(QDialog):
-    """Cancel leaves the session open. Yes stores notes. No closes without them."""
+    """Cancel leaves the session open. Yes stores a summary. No closes without one."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,9 +83,9 @@ class EndSessionDialog(QDialog):
         self.resize(480, 180)
         layout = QVBoxLayout(self)
         label = QLabel(
-            "End this session and store a summary and conclusions?\n\n"
+            "End this session and store a summary?\n\n"
             "Yes asks the local model, unless the session is very short. "
-            "No closes it and does not store a summary or conclusions. "
+            "No closes it and does not store a summary. "
             "Cancel leaves it open."
         )
         label.setWordWrap(True)
@@ -517,14 +517,73 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "Connection", message)
 
 
+def model_choices(current: str, names: list[str]) -> tuple[str, list[str]]:
+    """Installed names, with the session's model kept even if the list is empty."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        name = name.strip()
+        if name and name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    current = current.strip()
+    if not current:
+        return (cleaned[0] if cleaned else ""), cleaned
+    for name in cleaned:
+        if same_model(name, current):
+            return name, cleaned
+    return current, [current, *cleaned]
+
+
+class SeedModelDialog(QDialog):
+    """Ask which installed model a session started from earlier notes should use."""
+
+    def __init__(self, models: list[str], current: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New session")
+        self.choice = ""
+        layout = QVBoxLayout(self)
+        text = QLabel("Which model should this session use?")
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("seedModel")
+        self.model_combo.setMinimumWidth(280)
+        chosen, names = model_choices(current, models)
+        if names:
+            self.model_combo.addItems(names)
+            index = self.model_combo.findText(chosen)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+        layout.addWidget(self.model_combo)
+        row = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("primary")
+        self.start_button.setDefault(True)
+        self.start_button.setEnabled(self.model_combo.count() > 0)
+        row.addWidget(cancel)
+        row.addStretch(1)
+        row.addWidget(self.start_button)
+        layout.addLayout(row)
+        cancel.clicked.connect(self.reject)
+        self.start_button.clicked.connect(self._accept)
+
+    def _accept(self) -> None:
+        self.choice = self.model_combo.currentText().strip()
+        if not self.choice:
+            return
+        self.accept()
+
+
 def seed_button_label(kind: str) -> str:
     if kind == "summary":
         return "Start a new session with this summary"
-    return "Start a new session with this conclusion"
+    return "Start a new session with this prompt"
 
 
 class NoteDialog(QDialog):
-    """Read-only summary or conclusion, with a way to continue from that text alone."""
+    """Read-only summary or prompt, with a way to continue from that text alone."""
 
     def __init__(self, title: str, heading: str, body: str, seed_label: str, parent=None):
         super().__init__(parent)
@@ -555,7 +614,7 @@ class NoteDialog(QDialog):
 
 
 class NotesBrowser(QDialog):
-    """Every session, and the summaries and conclusions stored on it."""
+    """Every session, and the summaries and prompts stored on it."""
 
     def __init__(
         self,
@@ -571,11 +630,11 @@ class NotesBrowser(QDialog):
         self.protected_id = protected_id
         self._sessions = []
         self._note_items: list[HistoryItem] = []
-        self.setWindowTitle("Summaries and conclusions")
+        self.setWindowTitle("Summaries and prompts")
         self.resize(880, 520)
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Each session keeps the summaries and conclusions stored for it. "
+            "Each session keeps the summaries and prompts stored for it. "
             "Open one to start a new session from that text, or delete a session."
         )
         intro.setWordWrap(True)
@@ -651,24 +710,29 @@ class NotesBrowser(QDialog):
         self._note_items = build_history_items(
             [],
             self.db.list_summaries(session.id),
-            self.db.list_conclusions(session.id),
+            self.db.list_prompts(session.id),
         )
         summaries = sum(1 for item in self._note_items if item.kind == "summary")
-        conclusions = sum(1 for item in self._note_items if item.kind == "conclusion")
+        prompts = sum(1 for item in self._note_items if item.kind == "prompt")
 
         def counted(count: int, word: str) -> str:
             return f"{count} {word}" + ("" if count == 1 else "s")
 
         self.detail.setText(
             f"“{session.title}”  ·  {session.status}  ·  "
-            f"{counted(summaries, 'summary')}, {counted(conclusions, 'conclusion')}."
+            f"{counted(summaries, 'summary')}, {counted(prompts, 'prompt')}."
         )
         for item in self._note_items:
             when = item.created_at[11:16] if len(item.created_at) >= 16 else item.created_at
             preview = " ".join(item.content.split())
             if len(preview) > 90:
                 preview = preview[:87] + "..."
-            label = "Summary" if item.kind == "summary" else "Conclusion"
+            if item.kind == "summary":
+                label = "Summary"
+            elif item.actor == "grok":
+                label = "Prompt · Grok"
+            else:
+                label = "Prompt"
             self.notes.addItem(QListWidgetItem(f"{label}   {when}   {preview}"))
         if self._note_items:
             self.notes.setCurrentRow(0)
@@ -685,7 +749,7 @@ class NotesBrowser(QDialog):
         box.setWindowTitle("Delete session")
         box.setIcon(QMessageBox.Icon.Warning)
         box.setText(f"Delete “{session.title}”?")
-        detail = "This removes the transcript, summaries, and conclusions for that session."
+        detail = "This removes the transcript, summaries, and prompts for that session."
         if session.id == self.current_id:
             detail += " This is the session open in the window."
         box.setInformativeText(detail)
@@ -720,7 +784,7 @@ class NotesBrowser(QDialog):
         if row < 0 or row >= len(self._note_items):
             return
         item = self._note_items[row]
-        title = "Summary" if item.kind == "summary" else "Conclusion"
+        title = "Summary" if item.kind == "summary" else "Prompt"
         dialog = NoteDialog(
             title,
             f"{title} stored on this session.",
