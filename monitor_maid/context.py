@@ -269,17 +269,6 @@ def compose_selection_prompt(
     return "\n".join(parts).strip()
 
 
-def verification_prompt(items: list[HistoryItem], question: str) -> str:
-    kinds = sorted({item.kind for item in items})
-    listed = ", ".join(kinds) if kinds else "items"
-    custom = question.strip() or (
-        f"Verify the selected {listed} against the local transcript. "
-        "For each item say whether it is supported, only partly supported, or unsupported, "
-        "and quote the part of the transcript you used. Do not add new claims."
-    )
-    return compose_selection_prompt(items, custom)
-
-
 def build_history_items(
     turns: list[Turn],
     summaries: list[Summary],
@@ -329,6 +318,83 @@ def build_history_items(
         )
     items.sort(key=lambda item: item.created_at)
     return items
+
+
+def link_history(
+    turns: list[Turn],
+    items: list[HistoryItem],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map turn ids to history keys, and history keys back to turn ids.
+
+    Questions, answers, and Grok notes use the turn id. A summary or prompt
+    is a separate record: its id is not the turn id, so those rows are paired
+    with the summary or prompt turn that contains the same text, in order.
+    """
+    turn_to_key: dict[str, str] = {}
+    key_to_turn: dict[str, str] = {}
+    for item in items:
+        if item.kind in {"question", "answer", "grok"} and item.source_id:
+            turn_to_key.setdefault(item.source_id, item.key)
+            key_to_turn[item.key] = item.source_id
+    _pair_exact(
+        [turn for turn in turns if turn.kind == "summary"],
+        [item for item in items if item.kind == "summary"],
+        turn_to_key,
+        key_to_turn,
+    )
+    _pair_contained(
+        [turn for turn in turns if turn.kind == "prompt"],
+        [item for item in items if item.kind == "prompt"],
+        turn_to_key,
+        key_to_turn,
+    )
+    return turn_to_key, key_to_turn
+
+
+def _pair_exact(
+    turns: list[Turn],
+    items: list[HistoryItem],
+    turn_to_key: dict[str, str],
+    key_to_turn: dict[str, str],
+) -> None:
+    used: set[str] = set()
+    for item in items:
+        wanted = item.content.strip()
+        for turn in turns:
+            if turn.id in used:
+                continue
+            if turn.content.strip() == wanted:
+                used.add(turn.id)
+                turn_to_key.setdefault(turn.id, item.key)
+                key_to_turn[item.key] = turn.id
+                break
+
+
+def _pair_contained(
+    turns: list[Turn],
+    items: list[HistoryItem],
+    turn_to_key: dict[str, str],
+    key_to_turn: dict[str, str],
+) -> None:
+    """Walk prompt turns once so two fences in one reply stay in order."""
+    turn_index = 0
+    cursor = 0
+    for item in items:
+        body = item.content.strip()
+        if not body:
+            continue
+        while turn_index < len(turns):
+            text = turns[turn_index].content
+            found = text.find(body, cursor)
+            if found < 0:
+                turn_index += 1
+                cursor = 0
+                continue
+            turn = turns[turn_index]
+            turn_to_key.setdefault(turn.id, item.key)
+            key_to_turn[item.key] = turn.id
+            cursor = found + len(body)
+            break
 
 
 def normalise_summary(text: str | None) -> str:

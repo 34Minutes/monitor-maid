@@ -11,7 +11,7 @@ pytest.importorskip("PyQt6")
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from monitor_maid.db import Database
 from monitor_maid.ui.composer import Composer
@@ -33,6 +33,7 @@ def _type(edit, text: str) -> None:
 
 def test_enter_sends_and_ctrl_enter_adds_a_line(qapp):
     composer = Composer()
+    composer.resize(800, 280)
     composer.show()
     qapp.processEvents()
     sent = []
@@ -41,8 +42,14 @@ def test_enter_sends_and_ctrl_enter_adds_a_line(qapp):
     composer.send_both.connect(lambda local, grok: both.append((local, grok)))
     assert composer.enter_sends.objectName() == "enterSends"
     assert composer.enter_sends.isChecked()
-    assert composer.hint.isVisible()
-    assert "Enter sends" in composer.hint.text()
+    assert composer.local_edit.enter_submits is True
+    assert composer.grok_edit.enter_submits is True
+    labels = [label.text() for label in composer.findChildren(QLabel)]
+    assert not any("sends both" in text or "not on PATH" in text for text in labels)
+    local_top = composer.local_edit.mapTo(composer, composer.local_edit.rect().topLeft()).y()
+    grok_top = composer.grok_edit.mapTo(composer, composer.grok_edit.rect().topLeft()).y()
+    assert abs(local_top - grok_top) <= 2
+    assert abs(composer.local_edit.height() - composer.grok_edit.height()) <= 2
 
     composer.local_edit.setPlainText("hello")
     QTest.keyClick(composer.local_edit, Qt.Key.Key_Return)
@@ -76,6 +83,13 @@ def test_enter_sends_and_ctrl_enter_adds_a_line(qapp):
     _type(composer.local_edit, "both")
     _type(composer.grok_edit, "side")
     QTest.keyClick(
+        composer.local_edit,
+        Qt.Key.Key_Return,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert both == []
+    assert sent == ["hello"]
+    QTest.keyClick(
         composer.grok_edit,
         Qt.Key.Key_Return,
         Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
@@ -97,8 +111,8 @@ def test_toggle_restores_ctrl_enter_to_send(qapp):
     assert changed == [False]
     assert composer.local_edit.enter_submits is False
     assert composer.grok_edit.enter_submits is False
-    assert "⌘/Ctrl+Enter sends" in composer.hint.text()
     assert "⌘/Ctrl+Enter to send" in composer.local_edit.placeholderText()
+    assert "⌘/Ctrl+Enter to send" in composer.grok_edit.placeholderText()
 
     _type(composer.local_edit, "hello")
     QTest.keyClick(composer.local_edit, Qt.Key.Key_Return)

@@ -131,6 +131,34 @@ QFrame#bubble QPlainTextEdit {
     border: none;
     color: #e7e9ee;
 }
+QFrame#chatSearchBar {
+    background: #1b1f27;
+    border: 1px solid #2e3440;
+    border-radius: 8px;
+}
+QToolButton#chatSearchRegex,
+QToolButton#chatSearchPrevious,
+QToolButton#chatSearchNext {
+    background: #2a3140;
+    border: 1px solid #3c4558;
+    border-radius: 6px;
+    padding: 0;
+}
+QToolButton#chatSearchRegex:hover,
+QToolButton#chatSearchPrevious:hover,
+QToolButton#chatSearchNext:hover { background: #343d4e; }
+QToolButton#chatSearchRegex:checked {
+    background: #8a5a2a;
+    border-color: #c9843e;
+}
+QToolButton#chatSearchPrevious:disabled,
+QToolButton#chatSearchNext:disabled {
+    background: #22262e;
+}
+QLabel#chatSearchCount {
+    color: #9aa3b2;
+    background: transparent;
+}
 QLabel#dotUser { color: #8eb6ff; background: transparent; }
 QLabel#dotLocal { color: #8fceb0; background: transparent; }
 QLabel#dotGrok { color: #d7a6f5; background: transparent; }

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import threading
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -10,6 +12,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -25,7 +28,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from monitor_maid.config import Settings, effective_api_key, env_key_set
+from monitor_maid.config import Settings
+from monitor_maid.grok_build import GrokBuildError, grok_available, probe_grok, validate_directory
 from monitor_maid.context import build_history_items
 from monitor_maid.db import Database
 from monitor_maid.models import (
@@ -37,7 +41,6 @@ from monitor_maid.models import (
 )
 from monitor_maid.ollama_client import OllamaClient, same_model
 from monitor_maid.policy import compile_denylist
-from monitor_maid.xai_client import XAIClient
 
 
 class RecoveryDialog(QDialog):
@@ -189,7 +192,9 @@ class ApprovalDialog(QDialog):
         self.approve_button.setObjectName("primary")
         self.review_button.setEnabled(request.allow_review)
         if not request.allow_review:
-            self.review_button.setToolTip("Add an xAI API key in Settings, or set XAI_API_KEY.")
+            self.review_button.setToolTip(
+                "Install Grok Build so the grok command is on PATH."
+            )
         if request.blocked:
             self.approve_button.setEnabled(False)
             self.review_button.setEnabled(False)
@@ -323,15 +328,7 @@ class SettingsDialog(QDialog):
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.addWidget(self.ollama_model, 1)
         model_layout.addWidget(refresh)
-        self.xai_key = QLineEdit(settings.xai_api_key)
-        self.xai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        if env_key_set():
-            self.xai_key.setPlaceholderText("Ignored while XAI_API_KEY is set")
-        self.xai_model = QLineEdit(settings.xai_model)
-        self.xai_base = QLineEdit(settings.xai_base_url)
-        self.xai_timeout = QSpinBox()
-        self.xai_timeout.setRange(10, 3600)
-        self.xai_timeout.setValue(settings.xai_timeout)
+        self._kept_xai = settings
         self.exec_mode = QComboBox()
         self.relay_mode = QComboBox()
         for mode, label in MODE_LABELS.items():
@@ -345,6 +342,10 @@ class SettingsDialog(QDialog):
         self.relay_limit = QSpinBox()
         self.relay_limit.setRange(0, 100)
         self.relay_limit.setValue(settings.default_grok_relay_limit)
+        self.relay_limit.setToolTip(
+            "How many Grok and local round trips one Interact with Local click may run. "
+            "The toolbar uses the same number and can be changed while Interact is running."
+        )
         self.command_timeout = QSpinBox()
         self.command_timeout.setRange(1, 600)
         self.command_timeout.setValue(settings.command_timeout)
@@ -357,18 +358,13 @@ class SettingsDialog(QDialog):
         self.budget.setValue(settings.context_budget)
         self.review_first = QCheckBox("Ask Grok to review a command before it can run automatically")
         self.review_first.setChecked(settings.grok_review_before_exec)
-        self.monitor_default = QCheckBox("Open new sessions in monitor mode")
-        self.monitor_default.setChecked(settings.monitor_default)
+        self._monitor_default = settings.monitor_default
         self.denylist = QPlainTextEdit(settings.denylist)
         self.denylist.setMinimumHeight(140)
         form.addRow("Ollama URL", self.ollama_url)
         form.addRow("Ollama model", model_row)
         form.addRow("", self.model_note)
         form.addRow("Ollama timeout (s)", self.ollama_timeout)
-        form.addRow("xAI API key", self.xai_key)
-        form.addRow("xAI model", self.xai_model)
-        form.addRow("xAI base URL", self.xai_base)
-        form.addRow("xAI timeout (s)", self.xai_timeout)
         form.addRow("Default execution", self.exec_mode)
         form.addRow("Auto limit N", self.auto_limit)
         form.addRow("Default Grok forward", self.relay_mode)
@@ -377,24 +373,25 @@ class SettingsDialog(QDialog):
         form.addRow("Summary timeout (s)", self.summary_timeout)
         form.addRow("Context budget (chars)", self.budget)
         layout.addLayout(form)
-        if env_key_set():
-            note = QLabel("XAI_API_KEY is set in the environment and will be used instead of the stored key.")
-            note.setWordWrap(True)
-            note.setObjectName("muted")
-            layout.addWidget(note)
+        grok_note = QLabel(
+            "Grok uses the grok command on PATH. Sign in with grok login. "
+            "Choose the directory and session from the Grok menu. "
+            "XAI_API_KEY is read by that command, not by this app."
+        )
+        grok_note.setWordWrap(True)
+        grok_note.setObjectName("muted")
+        layout.addWidget(grok_note)
         layout.addWidget(self.review_first)
-        layout.addWidget(self.monitor_default)
         layout.addWidget(QLabel("Dangerous-command denylist (one regex per line)"))
         layout.addWidget(self.denylist, 1)
         probes = QHBoxLayout()
         test_ollama = QPushButton("Test Ollama")
-        self.test_xai = QPushButton("Test xAI")
+        self.test_grok = QPushButton("Test grok")
         test_ollama.clicked.connect(self._test_ollama)
-        self.test_xai.clicked.connect(self._test_xai)
-        self.xai_key.textChanged.connect(self._apply_xai_key_state)
-        self._apply_xai_key_state()
+        self.test_grok.clicked.connect(self._test_grok)
+        self._apply_grok_state()
         probes.addWidget(test_ollama)
-        probes.addWidget(self.test_xai)
+        probes.addWidget(self.test_grok)
         probes.addStretch(1)
         layout.addLayout(probes)
         buttons = QDialogButtonBox(
@@ -415,10 +412,10 @@ class SettingsDialog(QDialog):
             ollama_url=self.ollama_url.text().strip(),
             ollama_model=self.ollama_model.currentText().strip(),
             ollama_timeout=self.ollama_timeout.value(),
-            xai_api_key=self.xai_key.text(),
-            xai_model=self.xai_model.text().strip(),
-            xai_base_url=self.xai_base.text().strip(),
-            xai_timeout=self.xai_timeout.value(),
+            xai_api_key=self._kept_xai.xai_api_key,
+            xai_model=self._kept_xai.xai_model,
+            xai_base_url=self._kept_xai.xai_base_url,
+            xai_timeout=self._kept_xai.xai_timeout,
             default_execution_mode=str(mode),
             default_auto_limit=self.auto_limit.value(),
             default_grok_relay_mode=str(relay),
@@ -428,23 +425,17 @@ class SettingsDialog(QDialog):
             context_budget=self.budget.value(),
             denylist=self.denylist.toPlainText(),
             grok_review_before_exec=self.review_first.isChecked(),
-            monitor_default=self.monitor_default.isChecked(),
+            monitor_default=self._monitor_default,
         )
         settings.save(self.db)
         self.accept()
 
-    def _apply_xai_key_state(self) -> None:
-        ready = env_key_set() or bool(self.xai_key.text().strip())
-        tip = "" if ready else "Enter an xAI API key, or set XAI_API_KEY."
-        for widget in (
-            self.test_xai,
-            self.review_first,
-            self.monitor_default,
-            self.relay_mode,
-            self.relay_limit,
-        ):
-            widget.setEnabled(ready)
-            widget.setToolTip(tip)
+    def _apply_grok_state(self) -> None:
+        ready = grok_available()
+        tip = "" if ready else "The grok command is not on PATH."
+        self.review_first.setEnabled(ready)
+        self.review_first.setToolTip(tip)
+        self.test_grok.setEnabled(True)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -458,40 +449,28 @@ class SettingsDialog(QDialog):
     def _test_ollama(self) -> None:
         self._probe("ollama")
 
-    def _test_xai(self) -> None:
-        self._probe("xai")
+    def _test_grok(self) -> None:
+        self._probe("grok")
 
     def _probe(self, kind: str, *, quiet: bool = False) -> None:
         url = self.ollama_url.text().strip()
-        model = self.ollama_model.currentText().strip()
-        base = self.xai_base.text().strip()
-        xai_model = self.xai_model.text().strip()
-        key = self.xai_key.text().strip()
-        draft = Settings(xai_api_key=key, xai_base_url=base, xai_model=xai_model, ollama_url=url)
-        key = effective_api_key(draft)
         self._probe_gen += 1
         generation = self._probe_gen
-        if kind != "xai":
+        if kind != "grok":
             self.model_note.setText("Contacting Ollama…")
 
         def work() -> None:
             try:
-                if kind == "xai":
-                    reply = XAIClient(base, key).complete(
-                        xai_model,
-                        [
-                            {"role": "system", "content": "Reply with the single word pong."},
-                            {"role": "user", "content": "ping"},
-                        ],
-                        30,
-                    )
-                    message = "xAI replied: " + reply.text[:200]
+                if kind == "grok":
+                    message = probe_grok()
                 else:
                     names = OllamaClient(url).list_models()
                     if kind == "ollama-list":
                         message = "MODELS\n" + "\n".join(names)
                     else:
                         message = "Ollama models: " + (", ".join(names) if names else "(none)")
+            except GrokBuildError as exc:
+                message = str(exc)
             except Exception as exc:  # noqa: BLE001 — shown in the dialog
                 message = str(exc)
             self._probe_done.emit(generation, quiet, kind, message)
@@ -511,7 +490,7 @@ class SettingsDialog(QDialog):
             self.ollama_model.blockSignals(False)
             self.model_note.setText(note)
             return
-        if kind != "xai":
+        if kind != "grok":
             self.model_note.setText(message)
         if not quiet:
             QMessageBox.information(self, "Connection", message)
@@ -535,17 +514,107 @@ def model_choices(current: str, names: list[str]) -> tuple[str, list[str]]:
     return current, [current, *cleaned]
 
 
-class SeedModelDialog(QDialog):
-    """Ask which installed model a session started from earlier notes should use."""
+class LocalSessionDialog(QDialog):
+    """Folder and Ollama model for a new local session. This is not a Grok Build session."""
 
-    def __init__(self, models: list[str], current: str, parent=None):
+    def __init__(self, models: list[str], current: str, folder: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New local session")
+        self.choice_model = ""
+        self.choice_folder = ""
+        layout = QVBoxLayout(self)
+        text = QLabel(
+            "Host commands in this session run in this folder, and the local model is told that path. "
+            "Grok Build keeps its own directory, chosen from the Grok menu."
+        )
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        form = QFormLayout()
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder = QLineEdit(folder or str(Path.home()))
+        self.folder.setObjectName("localSessionFolder")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        folder_layout.addWidget(self.folder, 1)
+        folder_layout.addWidget(browse)
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("localSessionModel")
+        self.model_combo.setMinimumWidth(280)
+        chosen, names = model_choices(current, models)
+        if names:
+            self.model_combo.addItems(names)
+            index = self.model_combo.findText(chosen)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+        form.addRow("Working folder", folder_row)
+        form.addRow("Ollama model", self.model_combo)
+        layout.addLayout(form)
+        self.status = QLabel("")
+        self.status.setObjectName("muted")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        row = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("primary")
+        self.start_button.setDefault(True)
+        self.start_button.setEnabled(self.model_combo.count() > 0)
+        row.addWidget(cancel)
+        row.addStretch(1)
+        row.addWidget(self.start_button)
+        layout.addLayout(row)
+        cancel.clicked.connect(self.reject)
+        self.start_button.clicked.connect(self._accept)
+        self.resize(560, 220)
+
+    def _browse(self) -> None:
+        start = self.folder.text().strip() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Local working folder", start)
+        if chosen:
+            self.folder.setText(chosen)
+
+    def _accept(self) -> None:
+        model = self.model_combo.currentText().strip()
+        if not model:
+            self.status.setText("Choose a model.")
+            return
+        try:
+            folder = str(validate_directory(self.folder.text()))
+        except GrokBuildError as exc:
+            self.status.setText(str(exc))
+            return
+        self.choice_model = model
+        self.choice_folder = folder
+        self.accept()
+
+
+class SeedModelDialog(QDialog):
+    """Ask which folder and model a session started from earlier notes should use."""
+
+    def __init__(self, models: list[str], current: str, parent=None, folder: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("New session")
         self.choice = ""
+        self.folder_choice = ""
         layout = QVBoxLayout(self)
-        text = QLabel("Which model should this session use?")
+        text = QLabel(
+            "Which folder and model should this session use? "
+            "Host commands run in the folder."
+        )
         text.setWordWrap(True)
         layout.addWidget(text)
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder = QLineEdit(folder or str(Path.home()))
+        self.folder.setObjectName("seedFolder")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        folder_layout.addWidget(self.folder, 1)
+        folder_layout.addWidget(browse)
+        layout.addWidget(folder_row)
         self.model_combo = QComboBox()
         self.model_combo.setObjectName("seedModel")
         self.model_combo.setMinimumWidth(280)
@@ -556,6 +625,10 @@ class SeedModelDialog(QDialog):
             if index >= 0:
                 self.model_combo.setCurrentIndex(index)
         layout.addWidget(self.model_combo)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setObjectName("muted")
+        layout.addWidget(self.status)
         row = QHBoxLayout()
         cancel = QPushButton("Cancel")
         self.start_button = QPushButton("Start")
@@ -569,9 +642,21 @@ class SeedModelDialog(QDialog):
         cancel.clicked.connect(self.reject)
         self.start_button.clicked.connect(self._accept)
 
+    def _browse(self) -> None:
+        start = self.folder.text().strip() or os.getcwd()
+        chosen = QFileDialog.getExistingDirectory(self, "Local working folder", start)
+        if chosen:
+            self.folder.setText(chosen)
+
     def _accept(self) -> None:
         self.choice = self.model_combo.currentText().strip()
         if not self.choice:
+            self.status.setText("Choose a model.")
+            return
+        try:
+            self.folder_choice = str(validate_directory(self.folder.text()))
+        except GrokBuildError as exc:
+            self.status.setText(str(exc))
             return
         self.accept()
 

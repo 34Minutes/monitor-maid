@@ -67,6 +67,45 @@ GROK_SYSTEM_PROMPT = (
 )
 
 
+INTERACT_ASK = (
+    "This is an Interact with Local handoff inside Monitor Maid.\n"
+    "Use this Grok Build session only. Do not ask for the local model's transcript.\n"
+    "If that session contains work the local model on this computer should do, "
+    "write exactly one task in a closed fence:\n\n"
+    "```maid-to-local\n"
+    "the task, written as a normal user message\n"
+    "```\n\n"
+    "The local model sees only that task, plus its own earlier chat. "
+    "It may ask the app to run host commands. "
+    "You will be told only what the app ran and what came back "
+    "(status, exit code, stdout, and stderr), not the local model's other text.\n"
+    "Inside the fence, do not mention Grok or that another model wrote the task.\n"
+    "If there is nothing for the local model to do, reply with no maid-to-local fence."
+)
+
+
+def interact_result_prompt(report: str, *, final: bool) -> str:
+    """Wrapper results for Grok. This is not the local model's reply."""
+    if final:
+        follow = (
+            "This is the last round. Do not assign another task. "
+            "Reply briefly and do not include a maid-to-local fence."
+        )
+    else:
+        follow = (
+            "If more work remains for the local model, write exactly one closed "
+            "maid-to-local fence, as a normal user message, and do not mention Grok inside it. "
+            "If the work is finished, reply with no maid-to-local fence."
+        )
+    return (
+        "The wrapper ran the local model's host commands. "
+        "The report below is from the wrapper. "
+        "It is not the local model's reply, and that reply was not included.\n\n"
+        f"{report}\n\n"
+        f"{follow}"
+    )
+
+
 SUMMARY_INSTRUCTION = (
     "Write a short factual summary of this session in 4 to 8 sentences. "
     "Cover what the user asked and what was actually answered or done. "

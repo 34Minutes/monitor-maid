@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     grok_relay_limit INTEGER NOT NULL DEFAULT 4,
     grok_relay_used INTEGER NOT NULL DEFAULT 0,
     monitor_mode INTEGER NOT NULL DEFAULT 0,
-    ollama_model TEXT
+    ollama_model TEXT,
+    cwd TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS turns (
@@ -117,6 +118,7 @@ _SESSION_FIELDS = {
     "grok_relay_used",
     "monitor_mode",
     "ollama_model",
+    "cwd",
     "updated_at",
 }
 
@@ -148,6 +150,7 @@ class Database:
     def migrate(self) -> None:
         self._rename_conclusions_to_prompts()
         self._conn.executescript(SCHEMA)
+        self._ensure_session_cwd()
         self._finish_prompt_migration()
         if not self.get_setting("schema_version"):
             self.set_setting("schema_version", "1")
@@ -163,6 +166,18 @@ class Database:
         names = self._table_names()
         if "conclusions" in names and "prompts" not in names:
             self._conn.execute("ALTER TABLE conclusions RENAME TO prompts")
+
+    def _ensure_session_cwd(self) -> None:
+        if "sessions" not in self._table_names():
+            return
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "cwd" not in columns:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''"
+            )
 
     def _finish_prompt_migration(self) -> None:
         names = self._table_names()
@@ -236,6 +251,7 @@ class Database:
         grok_relay_limit: int,
         monitor_mode: bool,
         ollama_model: str | None,
+        cwd: str = "",
     ) -> Session:
         now = utc_now()
         session_id = _new_id()
@@ -245,8 +261,8 @@ class Database:
                 id, title, created_at, updated_at, closed_at, status,
                 execution_mode, auto_limit, auto_used,
                 grok_relay_mode, grok_relay_limit, grok_relay_used,
-                monitor_mode, ollama_model
-            ) VALUES (?, ?, ?, ?, NULL, 'open', ?, ?, 0, ?, ?, 0, ?, ?)
+                monitor_mode, ollama_model, cwd
+            ) VALUES (?, ?, ?, ?, NULL, 'open', ?, ?, 0, ?, ?, 0, ?, ?, ?)
             """,
             (
                 session_id,
@@ -259,6 +275,7 @@ class Database:
                 grok_relay_limit,
                 1 if monitor_mode else 0,
                 ollama_model,
+                cwd,
             ),
         )
         self._conn.commit()
@@ -639,6 +656,7 @@ def _session(row: sqlite3.Row) -> Session:
         grok_relay_used=int(row["grok_relay_used"]),
         monitor_mode=bool(row["monitor_mode"]),
         ollama_model=row["ollama_model"],
+        cwd=str(row["cwd"] or "") if "cwd" in row.keys() else "",
     )
 
 

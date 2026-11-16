@@ -15,9 +15,9 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from monitor_maid.context import build_history_items, build_local_messages
 from monitor_maid.db import Database
 from monitor_maid.models import NO_SUBSTANTIAL, HistoryItem, LLMReply
+from monitor_maid.grok_build import RunResult
 from monitor_maid.ollama_client import OllamaClient
 from monitor_maid.prompts import PROMPT_INSTRUCTION, SUMMARY_INSTRUCTION
-from monitor_maid.xai_client import XAIClient
 from monitor_maid.ui.dialogs import EndSessionDialog, NoteDialog, NotesBrowser, SeedModelDialog
 from monitor_maid.ui.main_window import MainWindow
 
@@ -49,6 +49,11 @@ def _wait_idle(window, qapp, steps: int = 150) -> None:
     raise AssertionError(window.status_label.text())
 
 
+def _open_session(window, qapp) -> None:
+    window.orchestrator.new_session()
+    qapp.processEvents()
+
+
 def _menu_texts(window) -> list[str]:
     menu = window.menuBar().actions()[0].menu()
     return [action.text() for action in menu.actions()]
@@ -60,6 +65,7 @@ def test_browse_deletes_a_session_and_keeps_the_rest(tmp_path, qapp):
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     current = window.orchestrator.session_id
     other = db.create_session(
         title="Discard me",
@@ -107,8 +113,8 @@ def test_browse_deletes_a_session_and_keeps_the_rest(tmp_path, qapp):
     browser._remove_session(current)
     window._apply_deleted_sessions(browser.deleted_ids)
     assert db.get_session(current) is None
-    assert window.orchestrator.session_id not in {None, current}
-    assert window.orchestrator.current() is not None
+    assert window.orchestrator.session_id is None
+    assert window.orchestrator.current() is None
     browser.close()
     _close(window, db, qapp)
     db.close()
@@ -120,6 +126,7 @@ def test_end_no_closes_without_storing_a_summary(tmp_path, qapp):
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     dialog = EndSessionDialog(window)
     assert [dialog.cancel_button.text(), dialog.yes_button.text(), dialog.no_button.text()] == [
         "Cancel",
@@ -153,6 +160,7 @@ def test_session_menu_stores_a_short_note_without_closing(tmp_path, qapp):
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     assert _menu_texts(window) == [
         "Rename session…",
         "",
@@ -252,6 +260,7 @@ def test_model_notes_seed_a_new_session_from_the_database(tmp_path, qapp, monkey
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     sid = window.orchestrator.session_id
     db.add_turn(
         sid,
@@ -359,6 +368,7 @@ def test_a_chat_reply_stores_a_prompt_only_when_marked(tmp_path, qapp, monkeypat
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     sid = window.orchestrator.session_id
     assert window.orchestrator.submit_local("Say something about a prompt.")
     _wait_idle(window, qapp)
@@ -391,20 +401,26 @@ def test_grok_prompt_is_stored_and_a_refusal_is_not(tmp_path, qapp, monkeypatch)
         LLMReply(text="No.", refused=True),
     ]
 
-    def fake_complete(self, model, messages, timeout):
-        assert any("standalone prompt" in message["content"] for message in messages)
-        return replies.pop(0)
+    def fake_run(spec, on_update=None, *, binary=None):
+        assert "standalone prompt" in spec.prompt
+        reply = replies.pop(0)
+        return RunResult(
+            exit_code=0,
+            session_id="11111111-1111-4111-8111-111111111111",
+            text=reply.text,
+            display=reply.text,
+            stderr="",
+            refused=reply.refused,
+        )
 
-    monkeypatch.setattr(XAIClient, "complete", fake_complete)
-    monkeypatch.setattr(
-        "monitor_maid.orchestrator.effective_api_key",
-        lambda _settings: "test-key",
-    )
+    monkeypatch.setattr("monitor_maid.orchestrator.run_prompt", fake_run)
+    monkeypatch.setattr("monitor_maid.orchestrator.grok_available", lambda: True)
     db = Database(tmp_path / "maid.db")
     db.migrate()
     window = MainWindow(db)
     window.show()
     qapp.processEvents()
+    _open_session(window, qapp)
     sid = window.orchestrator.session_id
     db.add_turn(
         sid,

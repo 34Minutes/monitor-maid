@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "monitor-maid"
 version = "0.1.0"
-description = "Desktop wrapper for a local Ollama model, with gated host commands and optional Grok review."
+description = "Desktop wrapper for a local Ollama model, with gated host commands and headless Grok Build sessions."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

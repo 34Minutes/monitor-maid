@@ -17,9 +17,8 @@ from collections.abc import Callable
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from monitor_maid.config import Settings, effective_api_key
+from monitor_maid.config import Settings
 from monitor_maid.context import (
-    build_grok_input,
     build_local_messages,
     build_review_input,
     compose_selection_prompt,
@@ -30,10 +29,21 @@ from monitor_maid.context import (
     seed_draft,
     shutdown_plan,
     summary_messages,
-    verification_prompt,
 )
 from monitor_maid.db import Database, utc_now
 from monitor_maid.executor import ExecResult, execute
+from monitor_maid.grok_build import (
+    GrokBuildError,
+    RunResult,
+    RunSpec,
+    config_path,
+    load_config,
+    messages_to_prompt,
+    parse_extra_flags,
+    run_prompt,
+    save_config,
+)
+from monitor_maid.grok_build import grok_available
 from monitor_maid.instructions import parse_instructions, parse_prompts, parse_relays, scrub_relay
 from monitor_maid.models import (
     NO_SUBSTANTIAL,
@@ -48,6 +58,7 @@ from monitor_maid.models import (
     Session,
 )
 from monitor_maid.ollama_client import OllamaClient, OllamaError
+from monitor_maid.prompts import INTERACT_ASK, interact_result_prompt
 from monitor_maid.policy import (
     apply_review_to_plan,
     assess_instruction,
@@ -57,7 +68,6 @@ from monitor_maid.policy import (
     plan_approval,
     plan_relay,
 )
-from monitor_maid.xai_client import XAIClient
 
 log = logging.getLogger("monitor_maid.orchestrator")
 
@@ -65,6 +75,8 @@ log = logging.getLogger("monitor_maid.orchestrator")
 class _Bridge(QObject):
     finished = pyqtSignal(int, object, object)
     health = pyqtSignal(object, object)
+    # ticket, chat text so far. Emitted from the grok reader thread.
+    grok_chunk = pyqtSignal(int, str)
 
 
 class Orchestrator(QObject):
@@ -80,11 +92,14 @@ class Orchestrator(QObject):
     shutdown_active = pyqtSignal(bool)
     shutdown_progress = pyqtSignal(str)
     accepting_changed = pyqtSignal(bool)
+    grok_live = pyqtSignal(str)
+    follow_up = pyqtSignal(str)
 
     def __init__(self, db: Database, hooks, *, cwd: str, process_log_dir):
         super().__init__()
         self.db = db
         self.hooks = hooks
+        self.launch_cwd = cwd
         self.cwd = cwd
         self.process_log_dir = process_log_dir
         self.session_id: str | None = None
@@ -95,6 +110,8 @@ class Orchestrator(QObject):
         self._bridge = _Bridge()
         self._bridge.finished.connect(self._on_worker)
         self._bridge.health.connect(self._on_health)
+        self._bridge.grok_chunk.connect(self._on_grok_chunk)
+        self._stream_ticket = 0
         self._ticket = 0
         self._worker_live = False
         self._background = True
@@ -113,18 +130,20 @@ class Orchestrator(QObject):
         self._relay_session: str | None = None
         self._after_relays: Callable[[], None] | None = None
         self._review_text: str | None = None
+        self._interact_rounds = 0
 
     def current(self) -> Session | None:
         if not self.session_id:
             return None
         return self.db.get_session(self.session_id)
 
-    def new_session(self, ollama_model: str | None = None) -> Session:
+    def new_session(self, ollama_model: str | None = None, cwd: str | None = None) -> Session:
         settings = Settings.load(self.db)
         model = (ollama_model or "").strip() or settings.ollama_model
         if (ollama_model or "").strip() and settings.ollama_model != model:
             settings.ollama_model = model
             settings.save(self.db)
+        folder = (cwd or "").strip() or self.launch_cwd
         session = self.db.create_session(
             title="New session",
             execution_mode=settings.default_execution_mode,
@@ -133,8 +152,10 @@ class Orchestrator(QObject):
             grok_relay_limit=settings.default_grok_relay_limit,
             monitor_mode=settings.monitor_default,
             ollama_model=model,
+            cwd=folder,
         )
         self.session_id = session.id
+        self._apply_cwd(folder)
         self.db.set_last_session(session.id)
         self._emit_session()
         log.info("opened session %s", session.id)
@@ -145,9 +166,33 @@ class Orchestrator(QObject):
             self.status_message.emit("Wait for the current reply before switching sessions.")
             return
         self.session_id = session_id
+        session = self.db.get_session(session_id)
+        self._apply_cwd(session.cwd if session else "")
         self.db.set_last_session(session_id)
         self._retry_kinds.clear()
         self._emit_session()
+
+    def clear_session(self) -> None:
+        """Leave the window with no local session selected."""
+        self.session_id = None
+        self.cwd = self.launch_cwd
+        self._retry_kinds.clear()
+        self._emit_session()
+
+    def set_session_folder(self, folder: str) -> None:
+        """Use this directory for host commands in the open session."""
+        session = self.current()
+        cleaned = folder.strip()
+        if session is None or not cleaned:
+            return
+        if session.cwd != cleaned:
+            self.db.update_session(session.id, cwd=cleaned)
+        self._apply_cwd(cleaned)
+        self.session_changed.emit()
+
+    def _apply_cwd(self, folder: str | None) -> None:
+        cleaned = (folder or "").strip()
+        self.cwd = cleaned or self.launch_cwd
 
     def reopen_current(self) -> None:
         session = self.current()
@@ -223,7 +268,7 @@ class Orchestrator(QObject):
         cleaned = text.strip()
         if not cleaned or not self._can_submit():
             return False
-        self._enqueue(Job(kind="grok", grok_text=cleaned, allow_relay=True))
+        self._enqueue(Job(kind="grok", grok_text=cleaned, allow_relay=False))
         return True
 
     def submit_both(self, local_text: str, grok_text: str) -> bool:
@@ -235,12 +280,12 @@ class Orchestrator(QObject):
             return False
         if local_clean and grok_clean:
             self._enqueue(
-                Job(kind="both", local_text=local_clean, grok_text=grok_clean, allow_relay=True)
+                Job(kind="both", local_text=local_clean, grok_text=grok_clean, allow_relay=False)
             )
         elif local_clean:
             self._enqueue(Job(kind="local", local_text=local_clean))
         else:
-            self._enqueue(Job(kind="grok", grok_text=grok_clean, allow_relay=True))
+            self._enqueue(Job(kind="grok", grok_text=grok_clean, allow_relay=False))
         return True
 
     def submit_selection_local(self, items: list[HistoryItem], question: str) -> bool:
@@ -258,22 +303,28 @@ class Orchestrator(QObject):
             Job(
                 kind="grok",
                 grok_text=compose_selection_prompt(items, question),
-                allow_relay=True,
+                allow_relay=False,
             )
         )
         return True
 
-    def submit_verification(self, items: list[HistoryItem], question: str) -> bool:
-        if not items or not self._can_submit():
+    def submit_interact(self) -> bool:
+        """Ask Grok for a local task, run host commands, and return only those results.
+
+        One click may repeat that round trip until Grok sends no task, or until
+        the session's Forward N is reached. N is read again before each round.
+        """
+        if self.current() is None:
+            self.status_message.emit("Open a local session first.")
             return False
-        self._enqueue(
-            Job(
-                kind="verify",
-                grok_text=verification_prompt(items, question),
-                allow_relay=False,
-                reply_kind="verification",
+        if not grok_available():
+            self.status_message.emit(
+                "grok was not found on PATH. Install Grok Build, then try again."
             )
-        )
+            return False
+        if not self._can_submit():
+            return False
+        self._enqueue(Job(kind="interact", allow_relay=False))
         return True
 
     def retry_last(self) -> bool:
@@ -441,19 +492,13 @@ class Orchestrator(QObject):
                 self._start_grok(
                     job.session_id or "",
                     self._finish_job,
-                    allow_relay=True,
+                    allow_relay=False,
                     reply_kind="message",
                 )
             elif job.kind == "both_retry":
                 self._start_local(job.session_id or "", self._then_grok)
-            elif job.kind == "verify":
-                self._prepare_turns(job)
-                self._start_grok(
-                    job.session_id or "",
-                    self._finish_job,
-                    allow_relay=False,
-                    reply_kind="verification",
-                )
+            elif job.kind == "interact":
+                self._start_interact(job.session_id or "")
             elif job.kind == "grok":
                 self._prepare_turns(job)
                 self._start_grok(
@@ -530,7 +575,7 @@ class Orchestrator(QObject):
         if not sid:
             self._finish_job()
             return
-        self._start_grok(sid, self._finish_job, allow_relay=True, reply_kind="message")
+        self._start_grok(sid, self._finish_job, allow_relay=False, reply_kind="message")
 
     # --- model calls -------------------------------------------------------
 
@@ -566,88 +611,102 @@ class Orchestrator(QObject):
         *,
         allow_relay: bool,
         reply_kind: str,
-        attempt: int = 0,
         gen: int | None = None,
+        prompt: str | None = None,
+        offer_followup: bool = True,
     ) -> None:
         if gen is None:
             self._grok_gen += 1
             gen = self._grok_gen
         if gen != self._grok_gen:
             return
-        settings = Settings.load(self.db)
-        key = effective_api_key(settings)
-        messages = build_grok_input(
-            self.db.list_turns(sid),
-            budget=settings.context_budget,
-        )
-        client = XAIClient(settings.xai_base_url, key)
-        timeout = settings.xai_timeout
-        model = settings.xai_model
-        self.status_message.emit(f"Waiting for Grok ({model})…")
-
-        def work() -> LLMReply:
-            return client.complete(model, messages, timeout)
-
-        def ok(reply: LLMReply) -> None:
-            if gen != self._grok_gen:
-                return
-            self._retry_kinds.discard("grok")
-            if reply.refused:
-                self.db.add_turn(
-                    sid,
-                    actor="grok",
-                    kind="refusal",
-                    content=reply.text,
-                    visible_to_local=False,
-                )
-                self.transcript_changed.emit()
-            else:
-                self._add_model_reply(sid, reply.text, "grok", unmarked_kind=reply_kind)
-            if reply.refused:
-                self.status_message.emit("Grok refused the request. Nothing was forwarded.")
-                on_complete()
-                return
-            if not allow_relay:
-                on_complete()
-                return
-            blocks = [block for block in parse_relays(reply.text) if scrub_relay(block.text)]
-            if not blocks:
-                on_complete()
-                return
-            self._relays = blocks
-            self._relay_i = 0
-            self._relay_session = sid
-            self._after_relays = on_complete
-            self._next_relay()
-
-        def err(exc: Exception) -> None:
-            if gen != self._grok_gen:
-                return
-            kind = getattr(exc, "kind", "")
-            if kind in {"rate_limit", "network"} and attempt < 2:
-                delay = getattr(exc, "retry_after", None) or float(2 ** (attempt + 1))
-                delay = min(max(delay, 1.0), 30.0)
-                self.status_message.emit(
-                    f"Grok is unavailable ({kind.replace('_', ' ')}). Retrying in {int(delay)}s."
-                )
-                QTimer.singleShot(
-                    int(delay * 1000),
-                    lambda: self._start_grok(
-                        sid,
-                        on_complete,
-                        allow_relay=allow_relay,
-                        reply_kind=reply_kind,
-                        attempt=attempt + 1,
-                        gen=gen,
-                    ),
-                )
-                return
-            self._retry_kinds.add("grok")
-            self._retry_session = sid
-            self._notice(sid, f"Grok request failed: {exc}")
+        text = prompt if prompt is not None else self._latest_grok_prompt(sid)
+        if not text.strip():
+            self._notice(sid, "There was no prompt to send to Grok Build.")
             on_complete()
+            return
+        # The Grok Build session already holds earlier turns. Send only the
+        # new prompt, then resume that session id on the next Ask Grok.
+        self._run_grok(
+            text,
+            bind=True,
+            on_ok=lambda result: self._apply_grok_reply(
+                sid,
+                result,
+                gen=gen,
+                allow_relay=allow_relay,
+                reply_kind=reply_kind,
+                offer_followup=offer_followup,
+                on_complete=on_complete,
+            ),
+            on_err=lambda exc: self._grok_failed(sid, exc, gen, on_complete),
+        )
 
-        self._run(work, ok, err)
+    def _apply_grok_reply(
+        self,
+        sid: str,
+        result: RunResult,
+        *,
+        gen: int,
+        allow_relay: bool,
+        reply_kind: str,
+        offer_followup: bool,
+        on_complete: Callable[[], None],
+    ) -> None:
+        if gen != self._grok_gen:
+            return
+        self._retry_kinds.discard("grok")
+        shown = result.display or result.text
+        if result.refused:
+            self.db.add_turn(
+                sid,
+                actor="grok",
+                kind="refusal",
+                content=shown or "Grok refused the request.",
+                visible_to_local=False,
+            )
+            self.transcript_changed.emit()
+            self.status_message.emit("Grok refused the request. Nothing was forwarded.")
+            on_complete()
+            return
+        self._add_model_reply(sid, shown, "grok", unmarked_kind=reply_kind)
+        if result.session_id:
+            self.status_message.emit(f"Grok Build session {result.session_id}")
+        else:
+            self.status_message.emit(
+                "Grok Build finished without a session id. Use streaming-json to capture one."
+            )
+        if offer_followup and result.session_id:
+            self.follow_up.emit(result.session_id)
+        if not allow_relay:
+            on_complete()
+            return
+        blocks = [block for block in parse_relays(result.text or shown) if scrub_relay(block.text)]
+        if not blocks:
+            on_complete()
+            return
+        self._relays = blocks
+        self._relay_i = 0
+        self._relay_session = sid
+        self._after_relays = on_complete
+        self._next_relay()
+
+    def _grok_failed(
+        self,
+        sid: str,
+        exc: Exception,
+        gen: int,
+        on_complete: Callable[[], None],
+    ) -> None:
+        if gen != self._grok_gen:
+            return
+        self._retry_kinds.add("grok")
+        self._retry_session = sid
+        partial = getattr(exc, "text", "") or ""
+        if partial.strip():
+            self._add_model_reply(sid, partial, "grok")
+        self._notice(sid, f"Grok request failed: {exc}")
+        on_complete()
 
     def _begin_instructions(
         self,
@@ -699,7 +758,7 @@ class Orchestrator(QObject):
             self.hooks.show_blocked(request, self._next_instruction)
             return
         wants_review = settings.grok_review_before_exec
-        if wants_review and effective_api_key(settings):
+        if wants_review and grok_available():
             self._review_command(
                 instruction,
                 lambda text, error: self._after_prefetch(plan, instruction, text, error),
@@ -708,7 +767,7 @@ class Orchestrator(QObject):
         if wants_review and plan == "auto":
             plan = "manual"
             safety.reasons = list(safety.reasons) + [
-                "Grok review is required before automatic execution, and no API key is set."
+                "Grok review is required before automatic execution, and grok is not on PATH."
             ]
         self._dispatch(plan, instruction, None, None, safety.reasons)
 
@@ -894,35 +953,32 @@ class Orchestrator(QObject):
     def _review_command(self, instruction: Instruction, on_done) -> None:
         sid = self._instr_session or ""
         settings = Settings.load(self.db)
-        key = effective_api_key(settings)
         messages = build_review_input(
             self.db.list_turns(sid),
             instruction.shell_text(),
             budget=settings.context_budget,
         )
-        client = XAIClient(settings.xai_base_url, key)
-        model = settings.xai_model
-        timeout = settings.xai_timeout
+        # A review is a one-shot. It does not resume the coding session,
+        # and its session id is not the one End session reports.
+        prompt = messages_to_prompt(messages)
         self.status_message.emit("Asking Grok to review the command…")
 
-        def work() -> LLMReply:
-            return client.complete(model, messages, timeout)
-
-        def ok(reply: LLMReply) -> None:
+        def ok(result: RunResult) -> None:
+            shown = result.display or result.text
             self.db.add_turn(
                 sid,
                 actor="grok",
-                kind="refusal" if reply.refused else "review",
-                content=reply.text,
+                kind="refusal" if result.refused else "review",
+                content=shown,
                 visible_to_local=False,
             )
             self.transcript_changed.emit()
-            on_done(reply.text, None)
+            on_done(result.text or shown, None)
 
         def err(exc: Exception) -> None:
             on_done(None, exc)
 
-        self._run(work, ok, err)
+        self._run_grok(prompt, bind=False, on_ok=ok, on_err=err)
 
     def _approval_request(
         self,
@@ -945,7 +1001,7 @@ class Orchestrator(QObject):
             blocked=blocked,
             review_text=review,
             review_error=review_error,
-            allow_review=bool(effective_api_key(settings)) and not blocked,
+            allow_review=grok_available() and not blocked,
             reason=reason,
         )
 
@@ -971,6 +1027,128 @@ class Orchestrator(QObject):
                 path=result.path or instruction.path,
             )
         return instruction
+
+    # --- interact ----------------------------------------------------------
+
+    def _start_interact(self, sid: str) -> None:
+        self._interact_rounds = 0
+        limit = self._interact_limit(sid)
+        if limit <= 0:
+            self.status_message.emit(
+                "Interact limit is 0. Raise Forward N to allow a round trip."
+            )
+            self._finish_job()
+            return
+        self._interact_prompt(sid, INTERACT_ASK, deliver_only=False)
+
+    def _interact_limit(self, sid: str) -> int:
+        session = self.db.get_session(sid)
+        if session is None:
+            return 0
+        return max(0, int(session.grok_relay_limit))
+
+    def _interact_prompt(self, sid: str, prompt: str, *, deliver_only: bool) -> None:
+        limit = self._interact_limit(sid)
+        if deliver_only:
+            self.status_message.emit(
+                f"Sending command results to Grok ({self._interact_rounds}/{limit})…"
+            )
+        else:
+            self.status_message.emit(
+                f"Asking Grok for a local task ({self._interact_rounds + 1}/{limit})…"
+            )
+        self.db.add_turn(
+            sid,
+            actor="user",
+            kind="message",
+            content=prompt,
+            visible_to_local=False,
+            metadata={"channel": "grok", "interact": True},
+        )
+        self.transcript_changed.emit()
+        before = {turn.id for turn in self.db.list_turns(sid)}
+
+        def done() -> None:
+            reply = self._newest_actor_text(sid, before, "grok")
+            if reply is None:
+                self.status_message.emit("Interact stopped because Grok did not reply.")
+                self._finish_job()
+                return
+            if deliver_only:
+                self.status_message.emit("Command results were sent to Grok. Interact finished.")
+                self._finish_job()
+                return
+            task = _closed_relay(reply)
+            if not task:
+                self.status_message.emit("Grok has no further task for the local model.")
+                self._finish_job()
+                return
+            limit_now = self._interact_limit(sid)
+            if self._interact_rounds >= limit_now:
+                self.status_message.emit(
+                    f"Interact stopped after {self._interact_rounds} round trips. "
+                    "Grok's next task was not sent."
+                )
+                self._finish_job()
+                return
+            self._interact_rounds += 1
+            self._interact_run_local(sid, task)
+
+        self._start_grok(
+            sid,
+            done,
+            allow_relay=False,
+            reply_kind="message",
+            prompt=prompt,
+            offer_followup=False,
+        )
+
+    def _interact_run_local(self, sid: str, task: str) -> None:
+        limit = self._interact_limit(sid)
+        self.status_message.emit(
+            f"Local model is working on Grok's task ({self._interact_rounds}/{limit})…"
+        )
+        self.db.add_turn(
+            sid,
+            actor="user",
+            kind="relay",
+            content=task,
+            visible_to_local=True,
+            metadata={"channel": "local", "relay": True, "interact": True},
+        )
+        self.transcript_changed.emit()
+        before_commands = {record.id for record in self.db.list_commands(sid)}
+        before_turns = {turn.id for turn in self.db.list_turns(sid)}
+
+        def done() -> None:
+            replied = self._newest_actor_text(sid, before_turns, "local_llm") is not None
+            if not replied:
+                self.status_message.emit("The local model did not reply. Interact stopped.")
+                self._finish_job()
+                return
+            records = [
+                record
+                for record in self.db.list_commands(sid)
+                if record.id not in before_commands
+            ]
+            report = _command_report(records)
+            limit_now = self._interact_limit(sid)
+            final = self._interact_rounds >= limit_now
+            self._interact_prompt(
+                sid,
+                interact_result_prompt(report, final=final),
+                deliver_only=final,
+            )
+
+        self._start_local(sid, done)
+
+    def _newest_actor_text(self, sid: str, before_ids: set[str], actor: str) -> str | None:
+        for turn in reversed(self.db.list_turns(sid)):
+            if turn.id in before_ids:
+                continue
+            if turn.actor == actor:
+                return turn.content
+        return None
 
     # --- relays ------------------------------------------------------------
 
@@ -1041,8 +1219,10 @@ class Orchestrator(QObject):
         if session.status == "closing":
             self.status_message.emit("This session is already closing.")
             return False
-        if kind == "prompt_grok" and not effective_api_key(Settings.load(self.db)):
-            self.status_message.emit("Add an xAI API key in Settings, or set XAI_API_KEY.")
+        if kind == "prompt_grok" and not grok_available():
+            self.status_message.emit(
+                "grok was not found on PATH. Install Grok Build, then try again."
+            )
             return False
         plan = shutdown_plan(self.db.list_turns(session.id))
         if kind == "summary":
@@ -1234,33 +1414,30 @@ class Orchestrator(QObject):
         if session is None:
             self._finish_job()
             return
-        settings = Settings.load(self.db)
-        key = effective_api_key(settings)
-        if not key:
-            self.status_message.emit("Add an xAI API key in Settings, or set XAI_API_KEY.")
+        if not grok_available():
+            self.status_message.emit(
+                "grok was not found on PATH. Install Grok Build, then try again."
+            )
             self._finish_job()
             return
+        settings = Settings.load(self.db)
         messages = grok_prompt_messages(
             self.db.list_turns(sid),
             budget=settings.context_budget,
         )
-        client = XAIClient(settings.xai_base_url, key)
-        timeout = settings.xai_timeout
-        model = settings.xai_model
+        prompt = messages_to_prompt(messages)
 
-        def work() -> LLMReply:
-            return client.complete(model, messages, timeout)
-
-        def ok(reply: LLMReply) -> None:
+        def ok(result: RunResult) -> None:
             if self.db.get_session(sid) is None:
                 self._finish_job()
                 return
-            if reply.refused:
+            shown = result.display or result.text
+            if result.refused:
                 self.status_message.emit("Grok refused the request. Nothing was stored.")
                 self._finish_job()
                 return
-            self._add_model_reply(sid, reply.text, "grok")
-            if not parse_prompts(reply.text):
+            self._add_model_reply(sid, shown, "grok")
+            if not parse_prompts(result.text or shown):
                 self.status_message.emit(
                     "The reply was not marked as a prompt. No prompt was stored."
                 )
@@ -1270,7 +1447,7 @@ class Orchestrator(QObject):
             self.status_message.emit(f"Could not create a prompt: {exc}")
             self._finish_job()
 
-        self._run(work, ok, err)
+        self._run_grok(prompt, bind=True, on_ok=ok, on_err=err)
 
     # --- shutdown ----------------------------------------------------------
 
@@ -1342,6 +1519,7 @@ class Orchestrator(QObject):
             self._emit_session()
             log.info("discarded empty session %s", sid)
             return
+        self._note_grok_session(sid)
         self.db.mark_closed(sid)
         self._emit_session()
         self.status_message.emit("Session closed without a summary.")
@@ -1357,9 +1535,103 @@ class Orchestrator(QObject):
             content=summary_text,
             visible_to_local=True,
         )
+        self._note_grok_session(sid)
         self.db.mark_closed(sid)
         self._emit_session()
         log.info("closed session %s", sid)
+
+    # --- Grok Build --------------------------------------------------------
+
+    def grok_config_file(self):
+        return config_path(self.db.path)
+
+    def _latest_grok_prompt(self, sid: str) -> str:
+        for turn in reversed(self.db.list_turns(sid)):
+            if turn.actor == "user" and not turn.visible_to_local:
+                return turn.content
+        return ""
+
+    def _spec_for(self, prompt: str, *, bind: bool) -> RunSpec:
+        config = load_config(self.grok_config_file())
+        cwd = config.cwd.strip() or self.cwd
+        resume = None
+        new_id = None
+        if bind and config.bound and config.session_id:
+            resume = config.session_id
+        elif bind and config.pending_session_id:
+            new_id = config.pending_session_id
+        try:
+            extra = parse_extra_flags(config.extra_flags) if bind else []
+        except GrokBuildError:
+            extra = []
+            if bind:
+                raise
+        return RunSpec(
+            cwd=cwd,
+            prompt=prompt,
+            resume_id=resume,
+            new_session_id=new_id,
+            model=config.model.strip() or None,
+            always_approve=config.always_approve,
+            output_format=config.output_format,
+            extra_args=extra,
+        )
+
+    def _remember_session(self, session_id: str) -> None:
+        path = self.grok_config_file()
+        config = load_config(path)
+        config.session_id = session_id
+        config.bound = True
+        config.pending_session_id = ""
+        if not config.cwd:
+            config.cwd = self.cwd
+        save_config(config, path)
+
+    def _note_grok_session(self, sid: str) -> None:
+        config = load_config(self.grok_config_file())
+        if not config.bound or not config.session_id:
+            return
+        self.db.add_turn(
+            sid,
+            actor="system",
+            kind="message",
+            content=f"Grok Build session: {config.session_id}",
+            visible_to_local=True,
+        )
+
+    def _run_grok(self, prompt: str, *, bind: bool, on_ok, on_err) -> None:
+        try:
+            spec = self._spec_for(prompt, bind=bind)
+        except GrokBuildError as exc:
+            on_err(exc)
+            return
+        self._stream_ticket += 1
+        ticket = self._stream_ticket
+        self.status_message.emit("Grok Build is running…")
+
+        def on_update(snapshot: str) -> None:
+            self._bridge.grok_chunk.emit(ticket, snapshot)
+
+        def work() -> RunResult:
+            return run_prompt(spec, on_update)
+
+        def ok(result: RunResult) -> None:
+            if bind and result.session_id:
+                self._remember_session(result.session_id)
+            on_ok(result)
+
+        def err(exc: Exception) -> None:
+            session_id = getattr(exc, "session_id", None)
+            if bind and session_id:
+                self._remember_session(str(session_id))
+            on_err(exc)
+
+        self._run(work, ok, err)
+
+    def _on_grok_chunk(self, ticket: int, snapshot: str) -> None:
+        if ticket != self._stream_ticket or not snapshot:
+            return
+        self.grok_live.emit(snapshot)
 
     # --- workers -----------------------------------------------------------
 
@@ -1435,6 +1707,49 @@ class Orchestrator(QObject):
         )
         self.transcript_changed.emit()
         self.status_message.emit(text.split("\n", 1)[0][:180])
+
+
+def _closed_relay(text: str) -> str:
+    """First closed maid-to-local fence. An unclosed fence is not a task."""
+    for block in parse_relays(text):
+        if block.partial:
+            continue
+        cleaned = scrub_relay(block.text)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _command_report(records: list[CommandRecord]) -> str:
+    """What the wrapper ran and what came back. Local prose is not included."""
+    if not records:
+        return "No host command was run."
+    chunks = []
+    for index, record in enumerate(records, start=1):
+        lines = [f"Result {index}", f"status: {record.status}"]
+        if record.decision:
+            lines.append(f"decision: {record.decision}")
+        if record.command:
+            lines.append(f"ran: {record.command}")
+        if record.exit_code is not None:
+            lines.append(f"exit code: {record.exit_code}")
+        elif record.status in {"rejected", "blocked"}:
+            lines.append("exit code: not run")
+        if record.decision_reason:
+            lines.append(f"note: {record.decision_reason}")
+        if record.stdout:
+            lines.append("stdout:\n" + _clip_report(record.stdout))
+        if record.stderr:
+            lines.append("stderr:\n" + _clip_report(record.stderr))
+        chunks.append("\n".join(lines))
+    return "\n\n".join(chunks)
+
+
+def _clip_report(text: str) -> str:
+    cleaned = text.rstrip()
+    if len(cleaned) <= 6000:
+        return cleaned
+    return cleaned[:6000] + "\n…(truncated)"
 
 
 def _emit_bridge(orchestrator: Orchestrator, name: str, *args) -> None:

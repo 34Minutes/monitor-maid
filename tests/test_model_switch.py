@@ -143,6 +143,7 @@ def test_model_list_sits_left_of_session_and_a_choice_loads_that_model(tmp_path,
     db.migrate()
     window = MainWindow(db)
     window.show()
+    window.orchestrator.new_session()
     for _ in range(50):
         qapp.processEvents()
         if window.model_combo.findText("arete-27b:latest") >= 0:
@@ -186,6 +187,8 @@ def test_seed_cancel_keeps_the_session_and_a_choice_starts_that_model(tmp_path, 
     db.migrate()
     window = MainWindow(db)
     window.show()
+    qapp.processEvents()
+    window.orchestrator.new_session()
     qapp.processEvents()
     sid = window.orchestrator.session_id
     db.add_turn(sid, actor="user", kind="message", content="keep me")

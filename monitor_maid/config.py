@@ -1,4 +1,9 @@
-"""Persisted settings. The environment variable XAI_API_KEY wins over the stored key."""
+"""Persisted settings.
+
+Grok Build does not read the stored xAI key. Those fields stay so an older
+database still opens. The grok command uses its own login, or XAI_API_KEY
+in the environment of that command.
+"""
 
 from __future__ import annotations
 

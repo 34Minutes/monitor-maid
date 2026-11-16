@@ -73,6 +73,7 @@ class Session:
     grok_relay_used: int
     monitor_mode: bool
     ollama_model: str | None
+    cwd: str = ""
 
 
 @dataclass
